@@ -80,12 +80,12 @@ Select text in any Windows app — the Harness agent explains or translates it i
 | 系统级手势检测（伴生进程） | 轮询左键状态与光标位置识别"拖选（位移 ≥5px）"与"双击选词（420ms/6px 内两次）"；落在浮层自己身上的点击忽略。 |
 | 取词（伴生进程） | 注入一次 Ctrl+C 后读剪贴板，**用剪贴板序号变化判定是否真的复制成功**，并把用户原来的剪贴板内容原样还原；控制台/终端窗口默认跳过（Ctrl+C 在那里是中断）。 |
 | 原生浮层（伴生进程） | 自己创建 `WS_POPUP` + `WS_EX_LAYERED|TOPMOST|TOOLWINDOW|NOACTIVATE` 窗口，GDI+ 画一帧到 32bpp DIB，`UpdateLayeredWindow` 带 alpha 贴屏；无边框、置顶、不抢焦点。 |
-| 交互 | 标题栏拖动、右下角缩放（Windows 原生）、菜单两项 hover/点击、回答窗口的复制/关闭/停止、滚轮滚动、全局 Esc 收起菜单。 |
+| 交互 | 标题栏拖动、**四边四角缩放**（八个方向都能用鼠标拉，指针会变成对应的双箭头）、菜单两项 hover/点击、回答窗口的复制/关闭/停止、滚轮滚动、全局 Esc 收起菜单。 |
 | 上下文（伴生进程） | 菜单弹出后用 UI Automation 读选区所在的**段落**（TextUnit_Paragraph），并用剪贴板文本校验 UIA 选区没串台；候选元素按"点上的元素 → 逐级祖先 → 焦点元素 → 逐级祖先"找（浏览器里点上的常常只是外壳），**第一次读不到会等 160ms 再读**（Chromium 这类应用是被 UIA 问到才打开无障碍树，冷启动第一次必失败）；读不到/超时/串台一律按"没有上下文"处理。 |
 | 朗读（伴生进程） | 进程内 COM 调 `ISpVoice`（`Speak` 异步 + `WaitUntilDone(0)` 轮询"还在读吗"），读的是选中的原文；面板关闭、开始新一轮、再点一次都会停。 |
 | `POST /api/dsh-selection-tools/run` | 同源 JSON 进、**SSE 出**（`session`/`delta`/`done`/`error`），内部跑真实 agent 回合。 |
 | `POST /api/dsh-selection-tools/stop` | 停止当前一轮，走官方 `agent.cancel({ kind: 'user' })`。 |
-| `GET /api/dsh-selection-tools/system/status` / `POST .../system/restart` | 伴生进程状态 / 重启（诊断用）。 |
+| `GET /api/dsh-selection-tools/system/status` / `POST .../system/restart` | 伴生进程状态 / 重启（诊断用）；重启会**等老进程真的退出**再拉起新的，不留幽灵进程。 |
 | 页内菜单 + 悬浮窗（客户端） | 注册进 `shell.overlay`；系统级接管时自动让位。 |
 
 > 不注册任何模型可见的工具，也不改官方源码。
@@ -130,7 +130,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 
 1. **任意应用**里选中文字（拖选 / 双击选词）。
 2. 选区右下角弹出菜单，点 **解释** 或 **翻译**（Esc 可收起）。
-3. 回答窗口在屏幕右下角打开并流式显示结果（带着选区所在的上下文一起问）；生成中可 **停止**，完成后可 **复制** 或 **关闭**（✕）；标题栏可拖动、右下角可拉伸。
+3. 回答窗口在屏幕右下角打开并流式显示结果（带着选区所在的上下文一起问）；生成中可 **停止**，完成后可 **复制** 或 **关闭**（✕）；**标题栏可拖动，四条边与四个角都能用鼠标拖着改大小**（指针会变成对应的双箭头）。
 
 翻译方向自动判定：源文本含中日韩字符 → 译成英文；否则译成中文。
 
@@ -155,13 +155,24 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 - **koffi 从 dsh 安装目录解析**：插件把宿主进程的 `argv[1]` 作为锚点传给伴生进程；插件自身不 import 任何 `@deepseek-ai/*`，否则以 `link:`/本地路径安装时会因跨盘符解析失败让整个 `dsh web` 起不来。
 - **koffi 的坑**：回调必须用 `koffi.proto` 先声明原型（裸字符串会报 `Unexpected character '(' in type specifier`），且被回调引用的结构体也要先定义；`SetWindowPos` 的 `hWndInsertAfter` 声明成 `intptr_t`（`HWND_TOPMOST=-1` 传给 `void *` 会被拒）；出参结构体要写 `_Out_`；`CreateCompatibleDC/BitBlt` 在 **gdi32** 不在 user32；koffi 的类型名是全局的，重复定义同名字会报 `Duplicate type name`（因此所有绑定模块都只建一次）。
 - **伴生进程必须声明 DPI 感知**：不声明时 Windows 把它当 DPI-unaware，坐标全落在被缩放的虚拟空间（实测 `GetSystemMetrics` 谎报 96dpi、虚拟屏幕 3627×1080，真实是 144dpi / 4480×1600），主副屏表现会不一致。现在启动第一件事就是 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`，尺寸按目标显示器的 `GetDpiForMonitor` 换算。
+- **伴生进程的重启要"干净"**：`/system/restart` 走 `companion.restart()`——先送走老进程、**等它真的退出**再拉起新的。三处细节缺一个就会留下"幽灵伴生进程"：两个进程各自钩一次全局鼠标、各自开一个浮层，用户看到两个菜单、两个回答窗口，而插件自己只认得新的那一个。
+  - `kill()` 偶尔漏杀：宽限期（默认 800ms）内还活着就直接 `taskkill /pid <pid> /T /F` 补刀。
+  - exit 回调要**认身份**（`child !== spawned` 直接 return）：老进程迟到的 exit 会把**新**进程的引用与状态一起抹掉（表现是重启后状态莫名变 `stopped`）。
+  - `stopping` 必须在 restart 里复位：它只在 `stop()` 里置位，不复位看门狗就永久失效（重启之后伴生进程再崩也不会自动起来）。
+  - 这三条都有单测钉着：`test/companion-manager.test.mjs`（注入 `spawnChild` 起真进程 + 假僵尸，退避与宽限可注入；反证过：把任一条改回去测试立刻红）。
 - **浮层页面脚本/文本渲染**：自绘的 markdown-lite 渲染器要自己处理标题级别、列表、代码块、粗体与 CJK 断行；标题正则必须把井号捕获成组（`^(#{1,4})[ ]+(.*)$`），写成 `^#{1,4}...` 时 `{1,4}` 是量词、正文会取到 `undefined`。
 - **状态对象要就地合并**：绘制回调里回写的 `contentHeight`/`stopBox` 必须落到调用方持有的同一个对象上，否则滚动条与"停止"命中框永远是空的。
 - **回答窗口的状态只归它自己**：`showMenu` 里任何一次 `ui.xxx = …` 都会在窗口下一次重绘时生效——早期版本在这里顺手重置了 `ui.source/answer/status`，于是"新划词后点一下窗口"就变成"显示新选中的文字 + 没有文本输出 + 就绪"。现在弹菜单只写 `state.selection`，窗口内容只在 `startRun` 里换（踩过，用户截图就是这个现象）。
 - **浏览器里第一次读上下文必然失败**：Chromium 是"被 UIA 问到才打开无障碍树"，冷启动那一刻 `GetCurrentPatternAs(TextPattern)` 拿不到东西（实测：第 0 次 `no text pattern`，第 1 次开始 selection/段落都正常）。所以 worker 里读失败要**等一下重试**（2 次 × 160ms），并且**别只看点上的元素**——点上的往往是外壳，得沿控制视图往上一层层找 TextPattern。
 - **SAPI 的 vtable 要按继承顺序数**：`ISpVoice` 继承 `ISpEventSource` ← `ISpNotifySource` ← `IUnknown`，所以 `Speak`=20、`SetRate`=28、`SetVolume`=30、`WaitUntilDone`=32（IDL 里每个接口都从 3 开始编号，直接照抄会打错函数）。
 - **设置要能被模型真的用上**：语言/规则/模型座位都在宿主半边的 `dsh-selection-tools.json` 里，跑一轮前现读；模型座位优先级 = 设置里的座位 > 请求带的 provider/model > 部署默认。验证方式很干脆：把座位改成不存在的模型，那一轮必须失败（否则说明设置没被用）。
-- **布局必须按窗口实际尺寸算**：回答窗口可以被用户用鼠标拖着改大小，`paintPanel`/`panelLayout`/`panelButtons`/`panelHit`/`hitZone` 全部要拿**实际**宽高（物理 ÷ 缩放 = DIP），不能钉死 `MODES.panel` 的 400×480（踩过：改完大小后正文/页脚还按老尺寸排版，窗口下方留一大片空白，右下角缩放手柄也跑偏）。
+- **布局必须按窗口实际尺寸算**：回答窗口可以被用户用鼠标拖着改大小，`paintPanel`/`panelLayout`/`panelButtons`/`panelHit`/`panelEdgeZone`/`panelHitZone` 全部要拿**实际**宽高（物理 ÷ 缩放 = DIP），不能钉死 `MODES.panel` 的 400×480（踩过：改完大小后正文/页脚还按老尺寸排版，窗口下方留一大片空白，缩放手柄也跑偏）。
+- **八个方向都要能拉**：缩放手柄是 `panelEdgeZone` 算出来的纯几何（**边 6 DIP / 角 16 DIP**），交给 `WM_NCHITTEST` 的 HT 边框代码，剩下的活由 Windows 自己干（窗口是 `WS_POPUP`、没有 `WS_THICKFRAME`，照样能拉）。三处必须一起对，否则"某条边拉不动"：
+  - **角要比边宽**：窗口圆角 16 DIP，最角落那几个像素画出来是透明的，而分层窗口的透明像素**不接收鼠标**——角区窄了就等于抓不住（左上/右上尤其明显）。
+  - **上边只占最外面 6 DIP**：再往下就是标题栏，要留给 `HTCAPTION` 拖动（早先版本整条上边都判成拖动区，所以上边"拉不动"；把 `HTTOP` 铺满整个标题栏又会反过来拖不动窗口）。
+  - **按钮优先**：缩放手柄就压在标题栏按钮与页脚「停止」旁边（上右角贴着关闭按钮、底边贴着「停止」），命中顺序必须是 按钮/「停止」 > 手柄 > 拖动 > 客户区，否则这两个按钮的边角会被手柄抢走。
+  - 指针形状自己换（`WM_SETCURSOR` + `RESIZE_CURSORS`）：类光标是 null，无边框弹窗上别指望 DefWindowProc 给出拉伸指针；"这条边能不能拉"全靠指针告诉用户。
+  - 命中区是纯函数，所以有单测钉着：`test/panel-zone.test.mjs` 覆盖八个方向、按钮优先、以及"按实际尺寸算"这几条。
 - **`WM_SIZE` 在创建期也会来**：`CreateWindowExW` 用的是 10×10 占位尺寸，创建期/隐藏期的 `WM_SIZE` 不能当作用户改过大小——否则会把 10×10 记成"用户尺寸"，回答窗口直接以 10×10 打开（踩过）。现在只在可见状态且超过下限时才记录，并顺手同步 `panel.rect`（命中判断与 `/capture` 都依赖它）。
 - **缩放要有下限**：处理 `WM_GETMINMAXINFO` 写 `ptMinTrackSize`（260×200 DIP × 缩放），否则能被拖成一条线，布局就没法看了。
 - **GDI+ 裁剪的合并模式**：见下条；另外 **koffi 3.2 里 `koffi.decode(bstr, 'const char16_t *')` 会直接把进程打成 ACCESS_VIOLATION**（UIA 的 BSTR 出参踩过）。稳定做法是先读 BSTR 头部 4 字节长度、再按 `char16_t` 数组解。裸 COM 调用靠 `koffi.call(函数指针, koffi.proto(...), ...)`，vtable 槽位序号必须对着 Windows SDK 的 `UIAutomationClient.idl` 数（`ElementFromPoint`=7、`GetCurrentPatternAs`=14、`GetSelection`=5、`ExpandToEnclosingUnit`=6、`GetText`=12）。
@@ -185,7 +196,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 pnpm install
 pnpm build          # tsdown：lib/index.js + lib/client.js
 pnpm typecheck
-pnpm test           # 手势状态机单测（node --test）
+pnpm test           # 单测（node --test）：手势状态机 + 八向缩放命中区 + 伴生进程生命周期
 pnpm verify:screenshots   # 校验 screenshots.json 里列的图确实在仓库里
 
 # 页内路径验收（需要本机 Chrome + 跑着的 dsh web；默认打 http://127.0.0.1:3080）
@@ -195,7 +206,7 @@ node scripts/verify-ui.cjs
 
 `screenshots.json`（仓库根）决定**插件市场详情页**展示哪些截图、按什么顺序展示——1–8 张，路径相对该文件本身。图片都在 `docs/`：换图推自己的仓库即可，下次构建自动生效；`pnpm verify:screenshots`（CI 也跑）防止改名后清单指向不存在的文件。
 
-系统级浮层的验收不需要动真实鼠标：伴生进程自带调试端点（`/simulate` `/click` `/wheel` `/capture`）。
+系统级浮层的验收不需要动真实鼠标：伴生进程自带调试端点（`/simulate` `/click` `/wheel` `/hittest` `/capture`）。
 
 ```sh
 # 1. 让浮层出现在指定屏幕坐标（等价于"在那里划了词"）
@@ -208,6 +219,9 @@ curl http://127.0.0.1:<companionPort>/status
 # 4. 抓一张浮层实图（BMP，可用画图/PowerShell 转 PNG）
 # 省略 file 就落到系统临时目录（dsh-selection-overlay.bmp）
 curl -X POST http://127.0.0.1:<companionPort>/capture -H "content-type: application/json" -d '{"file":"C:/Temp/overlay.bmp"}'
+# 5. 命中测试：某个 DIP 坐标落在哪个区、会回给 Windows 哪个 HT 代码（八向缩放就靠这张表）
+# 左边中点 → {"zone":"resize-left","code":10}；code 10/11/12/15 = 左/右/上/下，13/14/16/17 = 四个对角
+curl -X POST http://127.0.0.1:<companionPort>/hittest -H "content-type: application/json" -d '{"x":2,"y":240}'
 ```
 
 | 路径 | 作用 |
@@ -221,9 +235,9 @@ curl -X POST http://127.0.0.1:<companionPort>/capture -H "content-type: applicat
 | `companion/win32.mjs` | koffi/Win32 绑定（鼠标、剪贴板、窗口、DPI、显示器）。 |
 | `companion/gesture.mjs` | 手势状态机（纯函数，可单测）。 |
 | `companion/selection.mjs` | 剪贴板取词（含终端跳过与剪贴板还原）。 |
-| `companion/native/window.mjs` | 原生分层窗口 + WndProc + PeekMessage 消息泵 + 拖动/缩放命中。 |
+| `companion/native/window.mjs` | 原生分层窗口 + WndProc + PeekMessage 消息泵 + 拖动/八向缩放命中与光标。 |
 | `companion/native/gdi.mjs` | GDI+ 绑定与画笔（圆角、文字、测量、CJK/粗体断行排版）。 |
-| `companion/native/ui.mjs` | 三种形态的布局、绘制、命中测试与 markdown-lite。 |
+| `companion/native/ui.mjs` | 三种形态的布局、绘制、命中测试（含四边四角的缩放手柄）与 markdown-lite。 |
 | `companion/native/capture.mjs` | 抓屏为 BMP（验收/排障）。 |
 | `companion/native/probe.mjs` | 原生窗口冒烟探针（建窗→自绘→抓图）。 |
 

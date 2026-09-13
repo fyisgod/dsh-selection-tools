@@ -397,6 +397,8 @@ interface CompanionManager {
   status: () => CompanionStatus & { enabled: boolean; entry: string }
   start: () => void
   stop: () => void
+  /** 重启：先送走老进程（等它真的退出）再拉起新的。 */
+  restart: () => Promise<void>
 }
 
 /** 路由总入口。 */
@@ -411,8 +413,7 @@ async function handleRequest(ctx: AnyCtx, req: any, res: any, companion: Compani
     return
   }
   if (url.pathname === `${API_PREFIX}/system/restart`) {
-    companion.stop()
-    companion.start()
+    await companion.restart()
     writeJson(res, 200, { ok: true, companion: companion.status() })
     return
   }

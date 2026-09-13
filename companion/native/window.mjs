@@ -11,6 +11,7 @@
 
 const WM = {
   PAINT: 0x000f,
+  SETCURSOR: 0x0020,
   ERASEBKGND: 0x0014,
   NCHITTEST: 0x0084,
   LBUTTONDOWN: 0x0201,
@@ -42,12 +43,37 @@ const HT = {
 }
 
 /**
+ * 语义命中区 → `WM_NCHITTEST` 返回值。
+ *
+ * **八个方向都要映射**：窗口本身是 WS_POPUP、没有 WS_THICKFRAME，但只要命中区返回了
+ * HT 边框代码，DefWindowProc 就会起自己的缩放循环（拖动时窗口跟着动、WM_SIZE 回到
+ * 我们这边，绘制按新尺寸重排），四边与四角都是同一条路径。
+ */
+export const HIT_TEST_CODES = {
+  caption: HT.CAPTION,
+  'resize-left': HT.LEFT,
+  'resize-right': HT.RIGHT,
+  'resize-top': HT.TOP,
+  'resize-bottom': HT.BOTTOM,
+  'resize-topleft': HT.TOPLEFT,
+  'resize-topright': HT.TOPRIGHT,
+  'resize-bottomleft': HT.BOTTOMLEFT,
+  'resize-bottomright': HT.BOTTOMRIGHT,
+}
+
+/** 语义命中区 → HT 代码（认不出的区按客户区处理）。 */
+export function hitTestCode(zone) {
+  return HIT_TEST_CODES[zone] ?? HT.CLIENT
+}
+
+/**
  * 创建原生浮层窗口。
  * @param options.api - win32.mjs 的 createWin32() 产物（提供 koffi/user32/gdi32）。
  * @param options.gdi - native/gdi.mjs 的 createGdi() 产物。
  * @param options.title - 窗口标题（诊断用）。
  * @param options.onPaint - (painter, width, height, state) => void，state 由 setState 提供。
- * @param options.onHitTest - (x, y, state) => 'caption' | 'resize' | 'client'，决定拖动/缩放区。
+ * @param options.onHitTest - (x, y, state) => 语义命中区（'caption' | 'client' | 'resize-<方向>'），
+ *   决定这一块是拖动、点击还是缩放（八向缩放 = resize-left/right/top/bottom + 四个对角）。
  * @param options.onClick - (x, y, state) => boolean（true 表示已处理，需要重绘）。
  * @param options.onHover - (x, y, state) => boolean（hover 状态是否变化）。
  * @param options.onWheel - (delta, state) => boolean。
@@ -213,13 +239,30 @@ export function createNativeWindow(options) {
     sizeWE: 32644,
     sizeNS: 32645,
   }
-  function applyCursor(name) {
-    if (state.cursor === name) return
+  function applyCursor(name, force = false) {
+    if (!force && state.cursor === name) return
     state.cursor = name
     const id = CURSORS[name]
     if (id === null || id === undefined) return
     const handle = u.LoadCursorW(null, koffi.as(id, 'char16_t *'))
     if (handle !== null) u.SetCursor(handle)
+  }
+
+  /**
+   * 缩放方向的 HT 代码 → 光标形状。
+   *
+   * 光标必须自己换：类光标是 null，光靠 DefWindowProc 不保证在无边框弹窗上给出
+   * 拉伸指针；而"这条边能不能拉"全靠指针告诉用户（尤其是新加的上边）。
+   */
+  const RESIZE_CURSORS = {
+    [HT.LEFT]: 'sizeWE',
+    [HT.RIGHT]: 'sizeWE',
+    [HT.TOP]: 'sizeNS',
+    [HT.BOTTOM]: 'sizeNS',
+    [HT.TOPLEFT]: 'sizeNWSE',
+    [HT.BOTTOMRIGHT]: 'sizeNWSE',
+    [HT.TOPRIGHT]: 'sizeNESW',
+    [HT.BOTTOMLEFT]: 'sizeNESW',
   }
 
   /** 把一帧画进 DIB 并带 alpha 贴到屏幕。 */
@@ -295,16 +338,15 @@ export function createNativeWindow(options) {
         // Windows 会当成标题栏点击处理，**永远不会**把 WM_LBUTTONDOWN 发给客户区
         // （踩过：菜单项因此完全点不动）。
         const zone = options.onHitTest?.(localX, localY, state.data) ?? 'client'
-        if (zone === 'caption') return HT.CAPTION
-        if (zone === 'resize') return HT.BOTTOMRIGHT
-        if (zone === 'resize-left') return HT.LEFT
-        if (zone === 'resize-right') return HT.RIGHT
-        if (zone === 'resize-bottom') return HT.BOTTOM
-        if (zone === 'resize-top') return HT.TOP
-        if (zone === 'resize-bottomleft') return HT.BOTTOMLEFT
-        if (zone === 'resize-topleft') return HT.TOPLEFT
-        if (zone === 'resize-topright') return HT.TOPRIGHT
-        return HT.CLIENT
+        return hitTestCode(zone)
+      }
+      case WM.SETCURSOR: {
+        // 光标形状跟着命中区走：缩放边上要看到对应的双箭头。其余区（按钮、正文、
+        // 标题栏）交回 DefWindowProc，保持默认箭头。
+        const name = RESIZE_CURSORS[Number(lParam) & 0xffff]
+        if (name === undefined) return u.DefWindowProcW(hwnd, msg, wParam, lParam)
+        applyCursor(name, true)
+        return 1
       }
       case WM.MOUSEMOVE: {
         const x = (Number(lParam) & 0xffff) << 16 >> 16

@@ -42,9 +42,18 @@ export function palette(dark) {
 }
 
 /** 面板布局常量（DIP）。 */
-const PANEL = { padding: 14, headerHeight: 44, buttonSize: 28, sourcePadding: 8, sourceMaxHeight: 84, footerHeight: 34, scrollbarWidth: 4 }
+export const PANEL = { padding: 14, headerHeight: 44, buttonSize: 28, sourcePadding: 8, sourceMaxHeight: 84, footerHeight: 34, scrollbarWidth: 4 }
 /** 正文区底部与状态条之间留出的空隙（DIP）。 */
 const BOTTOM_INSET = 6
+
+/**
+ * 缩放手柄的宽度（DIP）：四条边一样窄，四个角都更大。
+ *
+ * 角必须比边宽：窗口圆角（`MODES.panel.radius` = 16 DIP）让最角落的几个像素画出来是
+ * 全透明的，而分层窗口（UpdateLayeredWindow）的透明像素**不接收鼠标**——角区窄了就等于
+ * 抓不住（尤其是左上/右上这种"角上就是圆角"的地方）。
+ */
+export const PANEL_RESIZE = { edge: 6, corner: 16 }
 
 /**
  * 面板各区域（DIP）。
@@ -111,6 +120,48 @@ export function panelHit(x, y, state, width = MODES.panel.width) {
     if (x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height) return 'stop'
   }
   return 'body'
+}
+
+/**
+ * 回答窗口的缩放命中区（DIP）：**四边 + 四角，八个方向都算**。
+ *
+ * 坐标传窗口的**实际**宽高（用户可以把窗口拖大拖小），钉死在设计尺寸上手柄就会跑偏。
+ * 落在边缘外一点点（原生缩放时坐标可能微负数）也算：比较本身就是"越界即命中"。
+ *
+ * @param width - 实际宽度（DIP）。
+ * @param height - 实际高度（DIP）。
+ * @returns `resize-<方向>`（left/right/top/bottom + 四个对角）；不在边缘上返回 null。
+ */
+export function panelEdgeZone(x, y, width = MODES.panel.width, height = MODES.panel.height) {
+  const nearLeft = x < PANEL_RESIZE.corner
+  const nearRight = x > width - PANEL_RESIZE.corner
+  const nearTop = y < PANEL_RESIZE.corner
+  const nearBottom = y > height - PANEL_RESIZE.corner
+  // 角优先：只有角区够宽，圆角那一圈才点得到（边只有 6 DIP）
+  if (nearLeft && nearTop) return 'resize-topleft'
+  if (nearRight && nearTop) return 'resize-topright'
+  if (nearLeft && nearBottom) return 'resize-bottomleft'
+  if (nearRight && nearBottom) return 'resize-bottomright'
+  if (x < PANEL_RESIZE.edge) return 'resize-left'
+  if (x > width - PANEL_RESIZE.edge) return 'resize-right'
+  // 上边只有最外面这 6 DIP 是缩放手柄：再往下就是标题栏，交给拖动（HTCAPTION）
+  if (y < PANEL_RESIZE.edge) return 'resize-top'
+  if (y > height - PANEL_RESIZE.edge) return 'resize-bottom'
+  return null
+}
+
+/**
+ * 回答窗口的完整命中区（DIP → 语义），原生窗口的 WM_NCHITTEST 直接吃这个结果。
+ *
+ * 优先级：**标题栏按钮 / 页脚「停止」 > 八向缩放手柄 > 标题栏（拖动） > 客户区**。
+ * 按钮必须先判：缩放手柄就压在它们旁边（上右角贴着关闭按钮、底边贴着「停止」），
+ * 反过来会把这两个按钮的边角抢走（踩过的方向：菜单项被 HTCAPTION 吃掉点不动）。
+ */
+export function panelHitZone(x, y, state, width = MODES.panel.width, height = MODES.panel.height) {
+  if (panelHit(x, y, state, width) !== 'body') return 'client'
+  const edge = panelEdgeZone(x, y, width, height)
+  if (edge !== null) return edge
+  return y < PANEL.headerHeight ? 'caption' : 'client'
 }
 
 // ---------------------------------------------------------------- 绘制

@@ -19,9 +19,9 @@ import { createGestureDetector } from './gesture.mjs'
 import { captureSelection, clampSelection } from './selection.mjs'
 import { createGdi } from './native/gdi.mjs'
 import { captureScreenRect } from './native/capture.mjs'
-import { createNativeWindow } from './native/window.mjs'
+import { createNativeWindow, hitTestCode } from './native/window.mjs'
 import { createSpeaker } from './native/speech.mjs'
-import { MODES, menuRowAt, paintMenu, paintPanel, panelHit } from './native/ui.mjs'
+import { MODES, menuRowAt, paintMenu, paintPanel, panelHit, panelHitZone } from './native/ui.mjs'
 import { createWin32, monitorScaleForPoint, primaryWorkArea, workAreaForPoint } from './win32.mjs'
 
 const DSH_ORIGIN = process.env.DSH_SELECTION_DSH_ORIGIN ?? 'http://127.0.0.1:3080'
@@ -197,10 +197,10 @@ const mainWindow = api !== null && gdi !== null && gdi.startup()
   : null
 
 /**
- * 回答窗口的命中区（物理 → 语义）。
+ * 回答窗口的实际尺寸（DIP）+ 缩放。
  *
  * 尺寸一律取**窗口当前的实际尺寸**：用户可以把窗口拖大拖小，命中区要是还按
- * 设计尺寸算，右下角的缩放手柄就会跑偏（踩过）。
+ * 设计尺寸算，四边四角的缩放手柄都会跑偏（踩过：改完大小后右下角手柄偏出窗口）。
  */
 function currentPanelSize() {
   const scale = mainWindow === null ? 1 : mainWindow.scale()
@@ -208,22 +208,16 @@ function currentPanelSize() {
   return { scale, width: Math.max(1, size.width) / scale, height: Math.max(1, size.height) / scale }
 }
 
+/**
+ * 回答窗口的命中区（物理 → 语义）。
+ *
+ * 区在 ui.mjs 的 panelHitZone 里（纯函数、可单测）：**四边 + 四角，八个方向都能
+ * 用鼠标拖着改大小**。优先级是 标题栏按钮 / 页脚「停止」 > 缩放手柄 > 标题栏拖动 >
+ * 客户区——上边最外面 6 DIP 是缩放手柄，再往下才轮到 HTCAPTION 拖动，两者不打架。
+ */
 function hitZone(x, y, data) {
   const { scale, width, height } = currentPanelSize()
-  const cssX = x / scale
-  const cssY = y / scale
-  const EDGE = 6
-  // 四角 + 左/右/下三边可缩放；上边留给标题栏拖动（HTCAPTION 与 HTTOP 会打架）
-  if (cssX < EDGE && cssY > height - EDGE) return 'resize-bottomleft'
-  if (cssX > width - EDGE && cssY > height - EDGE) return 'resize'
-  if (cssX < EDGE) return 'resize-left'
-  if (cssX > width - EDGE) return 'resize-right'
-  if (cssY > height - EDGE) return 'resize-bottom'
-  if (cssY < 44) {
-    const button = panelHit(cssX, cssY, data, width)
-    return button === 'body' ? 'caption' : 'client'
-  }
-  return 'client'
+  return panelHitZone(x / scale, y / scale, data, width, height)
 }
 
 /** 回答窗口标题栏上的点击（复制 / 关闭 / 停止）。 */
@@ -893,7 +887,9 @@ const server = createServer((req, res) => {
         const cssX = Number(body.x ?? 0)
         const cssY = Number(body.y ?? 0)
         const zone = target === 'menu' ? 'client' : hitZone(cssX * mainWindow.scale(), cssY * mainWindow.scale(), ui)
-        respondJson(res, 200, { ok: true, target, zone })
+        // code 是真正回给 Windows 的 WM_NCHITTEST 返回值（10=左 11=右 12=上 15=下，
+        // 13/14/16/17 是四个对角）：验收时看这个，别只看语义名字。
+        respondJson(res, 200, { ok: true, target, zone, code: hitTestCode(zone) })
       } catch (error) {
         respondJson(res, 500, { ok: false, message: String(error?.message ?? error) })
       }
