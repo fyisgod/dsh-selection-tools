@@ -23,6 +23,9 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      - name: 截图清单（screenshots.json 里的文件必须存在）
+        run: pnpm verify:screenshots
+
       - name: 类型检查
         run: pnpm typecheck
 

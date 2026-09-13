@@ -186,11 +186,14 @@ pnpm install
 pnpm build          # tsdown：lib/index.js + lib/client.js
 pnpm typecheck
 pnpm test           # 手势状态机单测（node --test）
+pnpm verify:screenshots   # 校验 screenshots.json 里列的图确实在仓库里
 
 # 页内路径验收（需要本机 Chrome + 跑着的 dsh web；默认打 http://127.0.0.1:3080）
 # 可用 DSH_WEB_URL / DSH_CHROME / PUPPETEER_CORE / DSH_SHOT_DIR 覆盖，见脚本头部注释
 node scripts/verify-ui.cjs
 ```
+
+`screenshots.json`（仓库根）决定**插件市场详情页**展示哪些截图、按什么顺序展示——1–8 张，路径相对该文件本身。图片都在 `docs/`：换图推自己的仓库即可，下次构建自动生效；`pnpm verify:screenshots`（CI 也跑）防止改名后清单指向不存在的文件。
 
 系统级浮层的验收不需要动真实鼠标：伴生进程自带调试端点（`/simulate` `/click` `/wheel` `/capture`）。
 

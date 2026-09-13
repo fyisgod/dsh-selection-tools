@@ -1,7 +1,7 @@
 {
   "name": "dsh-selection-tools",
   "version": "0.8.0",
-  "description": "DeepSeek Harness 划词工具：任意应用里选中文字即在锚点右下角弹出菜单，用 Harness 自己的 agent 解释/翻译（自动带上选区所在的上下文段落），结果落在零依赖的原生置顶浮窗里（可拖动/缩放）。",
+  "description": "DSH plugin: select text in any Windows app to explain or translate it with DeepSeek Harness's own agent, answered in a native always-on-top overlay (draggable, resizable). · DeepSeek Harness 划词工具：任意应用里选中文字即在锚点右下角弹出菜单，用 Harness 自己的 agent 解释/翻译（自动带上选区所在的上下文段落），结果落在零依赖的原生置顶浮窗里（可拖动/缩放）。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -28,15 +28,20 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/gesture.test.mjs"
+    "test": "node --test test/gesture.test.mjs",
+    "verify:screenshots": "node scripts/verify-screenshots.mjs"
   },
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "dsh-bundle",
     "deepseek-harness",
     "translate",
     "explain",
     "selection",
+    "text-selection",
+    "overlay",
+    "windows",
     "划词",
     "翻译",
     "解释"
