@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    # 插件是 Windows 专属（Win32 + GDI+），门禁在 Windows runner 上跑
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 单测（手势状态机）
+        run: pnpm test
+
+      - name: 构建
+        run: pnpm build
+
+      - name: 构建产物必须与源码一起提交（lib/）
+        run: git diff --exit-code -- lib

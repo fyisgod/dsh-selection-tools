@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+
+# 构建/调试产物
+*.tsbuildinfo
+.pnpm-store/
+probe-*.bmp
+overlay.bmp

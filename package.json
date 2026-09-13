@@ -1,0 +1,62 @@
+{
+  "name": "dsh-selection-tools",
+  "version": "0.8.0",
+  "description": "DeepSeek Harness 划词工具：任意应用里选中文字即在锚点右下角弹出菜单，用 Harness 自己的 agent 解释/翻译（自动带上选区所在的上下文段落），结果落在零依赖的原生置顶浮窗里（可拖动/缩放）。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "companion",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/gesture.test.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "translate",
+    "explain",
+    "selection",
+    "划词",
+    "翻译",
+    "解释"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fyisgod/dsh-selection-tools.git"
+  },
+  "homepage": "https://github.com/fyisgod/dsh-selection-tools#readme",
+  "bugs": {
+    "url": "https://github.com/fyisgod/dsh-selection-tools/issues"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsdown": "^0.23.0",
+    "typescript": "^5.6.0"
+  }
+}
