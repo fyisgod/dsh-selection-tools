@@ -81,3 +81,67 @@ export function pointInRect(point, rect) {
   if (rect === null || rect === undefined) return false
   return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom
 }
+
+/**
+ * 手势串行队列（latest-wins）。
+ *
+ * 取词要**注入 Ctrl+C 并读全局剪贴板**，所以两次取词绝不能重叠：后一次注入引起的剪贴板
+ * 变化会被前一次的轮询读到（前一次迟到的"还原"也会正好写在后一次的轮询窗口里），于是
+ * 菜单与回答窗口拿着一整段跟"这次选区"无关的文字弹出来——用户看到的就是"点菜单按钮后
+ * 窗口里的输入内容与选中的文字不符"。
+ *
+ * 规则：
+ * - 同一时刻只跑一个任务（真正的串行，不靠运气）；
+ * - 排队时只保留**最新**一次手势（用户最后划的那段才是他要的）；
+ * - 跑完时用 {@link createLatestQueue.isLatest} 判一下"结果还作不作数"——期间又来了
+ *   新手势的话，旧结果直接丢掉，不许拿它去弹菜单。
+ *
+ * @param options - \`run(payload, seq)\`、\`onError(error)\`。
+ */
+export function createLatestQueue(options = {}) {
+  const run = options.run ?? (async () => {})
+  const onError = options.onError ?? (() => {})
+  let running = false
+  let queued = null
+  let latest = 0
+
+  /** 依次跑完队列（同一时刻只有一个在跑）。 */
+  async function pump() {
+    if (running) return
+    running = true
+    try {
+      while (queued !== null) {
+        const job = queued
+        queued = null
+        try {
+          await run(job.payload, job.seq)
+        } catch (error) {
+          onError(error)
+        }
+      }
+    } finally {
+      running = false
+    }
+  }
+
+  return {
+    /**
+     * 提交一次手势。
+     * @returns 本次提交的序号（配合 isLatest 判断结果还算不算数）。
+     */
+    submit(payload) {
+      latest += 1
+      queued = { payload, seq: latest }
+      void pump()
+      return latest
+    },
+    /** 这个序号还是最新的吗（期间没有更新的手势进来）。 */
+    isLatest(seq) {
+      return seq === latest
+    },
+    /** 现在有任务在跑吗 / 有排队的手势吗（诊断用）。 */
+    stats() {
+      return { running, queued: queued !== null, latest }
+    },
+  }
+}

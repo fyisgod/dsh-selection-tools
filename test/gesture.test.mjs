@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { GESTURE_DEFAULTS, createGestureDetector, pointInRect } from '../companion/gesture.mjs'
+import { GESTURE_DEFAULTS, createGestureDetector, createLatestQueue, pointInRect } from '../companion/gesture.mjs'
 
 /** 收集手势的最小 harness。 */
 function harness(options = {}) {
@@ -70,4 +70,47 @@ test('pointInRect 边界', () => {
   assert.equal(pointInRect({ x: 5, y: 5 }, rect), true)
   assert.equal(pointInRect({ x: 11, y: 5 }, rect), false)
   assert.equal(pointInRect({ x: 5, y: 5 }, null), false)
+})
+
+
+/**
+ * 取词不能重叠：两次取词同时注入 Ctrl+C / 读同一个全局剪贴板，结果就会串台
+ * （用户看到的是"点菜单按钮后窗口里的输入内容与选中的文字不符"）。
+ * 队列负责"同一时刻只跑一个 + 只作数最新那次"。
+ */
+const tick = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+test('手势串行：同一时刻只有一个在跑，排队时只保留最新那次', async () => {
+  const events = []
+  const queue = createLatestQueue({
+    run: async (payload) => {
+      events.push('start:' + payload)
+      await tick(20)
+      events.push('end:' + payload)
+    },
+  })
+  const first = queue.submit('A')
+  queue.submit('B') // 跑 A 期间来的：被更晚的 C 顶掉
+  const third = queue.submit('C')
+  await tick(80)
+  assert.deepEqual(events, ['start:A', 'end:A', 'start:C', 'end:C'])
+  assert.equal(queue.isLatest(first), false, 'A 的结果已经被 C 取代，不能再拿去弹菜单')
+  assert.equal(queue.isLatest(third), true)
+})
+
+test('队列吃掉异常：一个任务抛错不影响后面的手势', async () => {
+  const errors = []
+  const done = []
+  const queue = createLatestQueue({
+    run: async (payload) => {
+      if (payload === 'boom') throw new Error('取词炸了')
+      done.push(payload)
+    },
+    onError: (error) => errors.push(error.message),
+  })
+  queue.submit('boom')
+  queue.submit('ok')
+  await tick(10)
+  assert.deepEqual(errors, ['取词炸了'])
+  assert.deepEqual(done, ['ok'])
 })

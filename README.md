@@ -78,7 +78,7 @@ Select text in any Windows app — the Harness agent explains or translates it i
 | 能力 | 说明 |
 | --- | --- |
 | 系统级手势检测（伴生进程） | 轮询左键状态与光标位置识别"拖选（位移 ≥5px）"与"双击选词（420ms/6px 内两次）"；落在浮层自己身上的点击忽略。 |
-| 取词（伴生进程） | 注入一次 Ctrl+C 后读剪贴板，**用剪贴板序号变化判定是否真的复制成功**，并把用户原来的剪贴板内容原样还原；控制台/终端窗口默认跳过（Ctrl+C 在那里是中断）。 |
+| 取词（伴生进程） | 注入一次 Ctrl+C 后读剪贴板（**用剪贴板序号变化判定是否真的复制成功**，并核对这次写入不是别的进程写的），随后把用户原来的剪贴板内容还原；**用户正按着 Ctrl+C、或用户在取词期间自己复制过，就一个字节都不碰剪贴板**；控制台/终端窗口默认跳过（Ctrl+C 在那里是中断）。取词的取舍每次都会记进 `/status` 的 `lastCapture`。 |
 | 原生浮层（伴生进程） | 自己创建 `WS_POPUP` + `WS_EX_LAYERED|TOPMOST|TOOLWINDOW|NOACTIVATE` 窗口，GDI+ 画一帧到 32bpp DIB，`UpdateLayeredWindow` 带 alpha 贴屏；无边框、置顶、不抢焦点。 |
 | 交互 | 标题栏拖动、**四边四角缩放**（八个方向都能用鼠标拉，指针会变成对应的双箭头）、菜单两项 hover/点击、回答窗口的复制/关闭/停止、滚轮滚动、全局 Esc 收起菜单。 |
 | 上下文（伴生进程） | 菜单弹出后用 UI Automation 读选区所在的**段落**（TextUnit_Paragraph），并用剪贴板文本校验 UIA 选区没串台；候选元素按"点上的元素 → 逐级祖先 → 焦点元素 → 逐级祖先"找（浏览器里点上的常常只是外壳），**第一次读不到会等 160ms 再读**（Chromium 这类应用是被 UIA 问到才打开无障碍树，冷启动第一次必失败）；读不到/超时/串台一律按"没有上下文"处理。 |
@@ -142,6 +142,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 | `DSH_SELECTION_HOOK` | `1` | 伴生进程侧开关：`0` = 只起浮层不做全局手势检测。 |
 | `DSH_SELECTION_POLL_MS` | `40` | 鼠标轮询间隔（毫秒）。 |
 | `DSH_SELECTION_MAX_TEXT` | `12000` | 单次划词字符上限。 |
+| `DSH_SELECTION_CLIPBOARD_OWNER` | `1` | 取词时是否核对"这次剪贴板写入不是别的进程写的"；`0` = 退回老行为（只看序号变化）——核对误伤了某个应用、取不到词时才关。 |
 | `DSH_SELECTION_MENU_TIMEOUT_MS` | `3600` | 划词菜单的显示时限（毫秒）。 |
 | `DSH_SELECTION_LOCALE` | 由插件传入 | 回答语言提示（`zh`/`en`）。 |
 | `DSH_SELECTION_DSH_ORIGIN` | `http://127.0.0.1:3080` | 伴生进程调用 DSH 路由的地址（插件自动传对）。 |
@@ -162,6 +163,13 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
   - 这三条都有单测钉着：`test/companion-manager.test.mjs`（注入 `spawnChild` 起真进程 + 假僵尸，退避与宽限可注入；反证过：把任一条改回去测试立刻红）。
 - **浮层页面脚本/文本渲染**：自绘的 markdown-lite 渲染器要自己处理标题级别、列表、代码块、粗体与 CJK 断行；标题正则必须把井号捕获成组（`^(#{1,4})[ ]+(.*)$`），写成 `^#{1,4}...` 时 `{1,4}` 是量词、正文会取到 `undefined`。
 - **状态对象要就地合并**：绘制回调里回写的 `contentHeight`/`stopBox` 必须落到调用方持有的同一个对象上，否则滚动条与"停止"命中框永远是空的。
+- **取词不能拿"剪贴板序号变了"就当成功**：剪贴板是全局的，用户自己在同一时间按 Ctrl+C、剪贴板管理器同步、别的应用复制，都会让它变。老实现把这些全当成"这次选区"，于是菜单与回答窗口拿着一整段跟选区无关的文字弹出来；更糟的是它取完词就"还原"，把用户刚复制的内容踩掉。现在的三条规则（`companion/selection.mjs`）：
+  - **用户此刻正按着 Ctrl+C → 一次都不注入**。我们注入的 Ctrl 抬起事件会把用户那个还没松开的组合键拆散（应用看到的是"一个没有 Ctrl 的 c"），而"还原"又会踩掉用户那次复制的成果——两条加起来就是"按了 Ctrl+C 却粘贴出旧内容"。
+  - **确定是别的进程写的那次 → 丢掉，继续等**（真正那次复制通常紧跟其后）。判据是剪贴板属主窗口的进程；UWP 那种"前台是框架窗口、真正复制的是它的子窗口"按顶层祖先的进程认成一家人。**认不出属主时放行**——环境事实：实测本机剪贴板里上一次复制的内容就是"无属主"的（写入进程已退出/无窗口写入），一律拒绝会让个别应用再也弹不出菜单（所以默认放行）。
+  - **还原只在"读完之后没人再写过、且用户没在此期间自己复制过"时才做**；没取到词时一律不还原（那会儿剪贴板里可能是别人刚写的东西）。
+- **两次取词绝不能重叠**：取词要注入按键 + 读同一个全局剪贴板。重叠时，后一次注入引起的序号变化会被前一次的轮询读到，前一次迟到的"还原"也会正好写在后一次的轮询窗口里——这是"回答窗口里的输入内容与选中文字不符"的另一条来路。所以手势进 `createLatestQueue`（`companion/gesture.mjs`）：同一时刻只跑一个，排队只留最新一次，跑完发现已经有新手势进来就直接丢掉结果（不弹菜单）。
+- **菜单要绑定"它自己那次选区"**：点菜单项时不能现读全局的 `state.selection`——用户点下去的那一刻可能刚好又有一次划词完成，于是"回答窗口里的输入内容"跟"用户看着菜单点的那段文字"对不上。`showMenu` 把选区存进 `menu.selection`，点菜单项（含 `/click` 验收端点）一律用它。
+- 取词这三条与队列都有单测钉着：`test/selection.test.mjs` 用假 Win32 造出"用户自己按 Ctrl+C""别的进程写剪贴板""我们刚读完就被人写""注入没人响应"这些时序，`test/gesture.test.mjs` 钉队列；反证过：把任一条改回老行为，测试立刻红。
 - **回答窗口的状态只归它自己**：`showMenu` 里任何一次 `ui.xxx = …` 都会在窗口下一次重绘时生效——早期版本在这里顺手重置了 `ui.source/answer/status`，于是"新划词后点一下窗口"就变成"显示新选中的文字 + 没有文本输出 + 就绪"。现在弹菜单只写 `state.selection`，窗口内容只在 `startRun` 里换（踩过，用户截图就是这个现象）。
 - **浏览器里第一次读上下文必然失败**：Chromium 是"被 UIA 问到才打开无障碍树"，冷启动那一刻 `GetCurrentPatternAs(TextPattern)` 拿不到东西（实测：第 0 次 `no text pattern`，第 1 次开始 selection/段落都正常）。所以 worker 里读失败要**等一下重试**（2 次 × 160ms），并且**别只看点上的元素**——点上的往往是外壳，得沿控制视图往上一层层找 TextPattern。
 - **SAPI 的 vtable 要按继承顺序数**：`ISpVoice` 继承 `ISpEventSource` ← `ISpNotifySource` ← `IUnknown`，所以 `Speak`=20、`SetRate`=28、`SetVolume`=30、`WaitUntilDone`=32（IDL 里每个接口都从 3 开始编号，直接照抄会打错函数）。
@@ -183,7 +191,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 
 ## 风险与边界
 
-- **取词会短暂接管剪贴板**（注入 Ctrl+C 读剪贴板，随后把原内容写回）；控制台/终端窗口默认跳过。
+- **取词会短暂接管剪贴板**（注入 Ctrl+C 读剪贴板，随后把原内容写回）：用户此刻正按着 Ctrl+C、或取词期间用户自己复制过，则完全不碰剪贴板；取词期间别人写的剪贴板内容不会被当成选区；控制台/终端窗口默认跳过。
 - **只支持 Windows**：Win32 + GDI+ 专用；其它平台退化为页内划词路径。
 - 浮层是**原生自绘**：markdown 支持标题/列表/引用/代码块/粗体/行内码/表格（表格按等宽行排版），不追求浏览器级的排版细节；正文不可选中，复制用面板上的复制按钮。
 - 划词长度上限 12000 字符；超出直接报错，而不是把整篇文档塞给模型。
@@ -196,7 +204,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 pnpm install
 pnpm build          # tsdown：lib/index.js + lib/client.js
 pnpm typecheck
-pnpm test           # 单测（node --test）：手势状态机 + 八向缩放命中区 + 伴生进程生命周期
+pnpm test           # 单测（node --test）：手势状态机与串行队列 + 剪贴板取词竞态 + 八向缩放命中区 + 伴生进程生命周期
 pnpm verify:screenshots   # 校验 screenshots.json 里列的图确实在仓库里
 
 # 页内路径验收（需要本机 Chrome + 跑着的 dsh web；默认打 http://127.0.0.1:3080）
@@ -214,7 +222,8 @@ curl -X POST http://127.0.0.1:<companionPort>/simulate -H "content-type: applica
      -d '{"text":"The scheduler multiplexes goroutines onto OS threads.","x":700,"y":300}'
 # 2. 点第二行（翻译）：DIP 坐标 (120, 76)
 curl -X POST http://127.0.0.1:<companionPort>/click -H "content-type: application/json" -d '{"x":120,"y":76}'
-# 3. 看状态（是否完成、答案长度、内容高度）
+# 3. 看状态（是否完成、答案长度、内容高度）；lastCapture 说清上次取词的取舍
+#    （injected / reason / owner / restore），gestures 是手势队列状态
 curl http://127.0.0.1:<companionPort>/status
 # 4. 抓一张浮层实图（BMP，可用画图/PowerShell 转 PNG）
 # 省略 file 就落到系统临时目录（dsh-selection-overlay.bmp）
@@ -233,8 +242,8 @@ curl -X POST http://127.0.0.1:<companionPort>/hittest -H "content-type: applicat
 | `src/client/index.tsx` / `overlay.tsx` / `styles.ts` / `api.ts` | 页内划词菜单 + 悬浮窗（React + 官方槽位）。 |
 | `companion/main.mjs` | 伴生进程主体：轮询、取词、原生浮层编排、本地 HTTP。 |
 | `companion/win32.mjs` | koffi/Win32 绑定（鼠标、剪贴板、窗口、DPI、显示器）。 |
-| `companion/gesture.mjs` | 手势状态机（纯函数，可单测）。 |
-| `companion/selection.mjs` | 剪贴板取词（含终端跳过与剪贴板还原）。 |
+| `companion/gesture.mjs` | 手势状态机 + 手势串行队列（纯函数，可单测）。 |
+| `companion/selection.mjs` | 剪贴板取词：终端跳过、只丢"别的进程写的"那次、还原只在无人再写时做。 |
 | `companion/native/window.mjs` | 原生分层窗口 + WndProc + PeekMessage 消息泵 + 拖动/八向缩放命中与光标。 |
 | `companion/native/gdi.mjs` | GDI+ 绑定与画笔（圆角、文字、测量、CJK/粗体断行排版）。 |
 | `companion/native/ui.mjs` | 三种形态的布局、绘制、命中测试（含四边四角的缩放手柄）与 markdown-lite。 |
