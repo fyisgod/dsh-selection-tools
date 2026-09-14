@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createContextReader } from './context.mjs'
-import { createGestureDetector } from './gesture.mjs'
+import { createGestureDetector, createLatestQueue } from './gesture.mjs'
 import { captureSelection, clampSelection } from './selection.mjs'
 import { createGdi } from './native/gdi.mjs'
 import { captureScreenRect } from './native/capture.mjs'
@@ -36,6 +36,11 @@ const MENU_TIMEOUT_MS = Number(process.env.DSH_SELECTION_MENU_TIMEOUT_MS ?? 3600
 const CONTEXT_TIMEOUT_MS = Number(process.env.DSH_SELECTION_CONTEXT_TIMEOUT_MS ?? 1800)
 /** 上下文开关（`DSH_SELECTION_CONTEXT=0` 可关掉）。 */
 const CONTEXT_ENABLED = process.env.DSH_SELECTION_CONTEXT !== '0'
+/**
+ * 取词时是否校验"这次剪贴板写入来自前台窗口"（`DSH_SELECTION_CLIPBOARD_OWNER=0` 可关掉）。
+ * 关掉就退回老行为：只要剪贴板序号变了就当作取词成功——遇到取不到词的个别应用才需要关。
+ */
+const OWNER_CHECK = process.env.DSH_SELECTION_CLIPBOARD_OWNER !== '0'
 const GAP = 8
 const VK_LBUTTON = 0x01
 const VK_RBUTTON = 0x02
@@ -65,8 +70,14 @@ const ui = {
   stopBox: null,
 }
 
-/** 划词菜单状态。 */
-const menu = { visible: false, rect: null, scale: 1, anchor: null, hover: -1, timer: null, dark: true }
+/**
+ * 划词菜单状态。
+ *
+ * `selection` 是**这个菜单是为哪次选区弹的**：点菜单项时一律用它，不用当时的
+ * `state.selection`——用户点下去的那一刻可能刚好又有一次划词完成了，用后者会让
+ * "回答窗口里的输入内容"跟"用户看着菜单点的那段文字"对不上。
+ */
+const menu = { visible: false, rect: null, scale: 1, anchor: null, hover: -1, timer: null, dark: true, selection: null }
 /** 回答窗口状态（`size` 是用户手动改过的大小，物理像素）。 */
 const panel = { mode: 'hidden', rect: null, scale: 1, position: null, size: null }
 
@@ -81,6 +92,9 @@ const state = {
   startedAt: Date.now(),
   errors: [],
 }
+
+/** 手势串行队列（startHook 里建；/status 汇报它的状态）。 */
+let gestureQueue = null
 
 /** 上下文读取器（worker 线程；钩子关掉或显式禁用时不建）。 */
 const contextReader = api !== null && gdi !== null && CONTEXT_ENABLED
@@ -420,8 +434,10 @@ const menuWindow = api !== null && gdi !== null
         const row = menuRowAt(x / scale, y / scale)
         void data
         if (row >= 0) {
+          // 先取"这个菜单绑的那次选区"，再收菜单（hideMenu 会清掉它）
+          const selection = menu.selection
           hideMenu('item-click')
-          startRun(row === 0 ? 'explain' : 'translate')
+          startRun(row === 0 ? 'explain' : 'translate', selection)
         }
         return true
       },
@@ -491,7 +507,9 @@ function showMenu(text, x, y) {
   // 只记"这次选了什么"：回答窗口的内容归它自己，绝不在弹菜单时被改写
   // （踩过：这里顺手把 ui.source/answer/status 重置了，于是新划词后只要窗口重绘一次，
   //  就变成"显示新选中的文字 + 没有文本输出 + 就绪"。现在只有点解释/翻译才换内容。）
-  state.selection = { text, x, y, at: Date.now(), context: '', contextUnit: '', contextState: 'idle' }
+  const selection = { text, x, y, at: Date.now(), context: '', contextUnit: '', contextState: 'idle' }
+  state.selection = selection
+  menu.selection = selection
   menu.dark = systemDark()
   const css = MODES.menu
   const work = workAreaForPoint(api, x, y)
@@ -513,7 +531,7 @@ function showMenu(text, x, y) {
   }, MENU_TIMEOUT_MS)
   menu.timer.unref?.()
   // 菜单已经可见了才开始读上下文：不给"划词 → 菜单"这条链路加延迟。
-  startContextRead(state.selection)
+  startContextRead(selection)
   return menu.rect
 }
 
@@ -530,6 +548,7 @@ function hideMenu(reason) {
   }
   menu.rect = null
   menu.hover = -1
+  menu.selection = null
 }
 
 // ---------------------------------------------------------------- 跑一轮 agent
@@ -581,13 +600,17 @@ async function stopRun() {
   }
 }
 
-/** 发起一轮解释/翻译，流式画到回答窗口。 */
-function startRun(action) {
+/**
+ * 发起一轮解释/翻译，流式画到回答窗口。
+ * @param action - 解释 / 翻译。
+ * @param selection - 这一次要处理哪段选区（菜单上绑的那一次）；缺席时退回"最近一次划词"。
+ */
+function startRun(action, selection = state.selection) {
   state.run?.abort?.()
   ui.action = action
   // 只有点菜单项才换内容：这里把"这次要处理什么"写进回答窗口
   // （别处一律不动 ui.source —— 新划词只更新 state.selection，不会改窗口）
-  ui.source = state.selection === null ? '' : state.selection.text
+  ui.source = selection === null ? '' : selection.text
   ui.answer = ''
   ui.error = ''
   ui.copyFeedback = ''
@@ -601,7 +624,6 @@ function startRun(action) {
 
   const controller = new AbortController()
   state.run = { abort: () => controller.abort(), sessionId: undefined }
-  const selection = state.selection
   const text = selection === null ? '' : selection.text
   void (async () => {
     try {
@@ -693,27 +715,46 @@ function inRect(point, rect) {
   return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height
 }
 
-async function handleGesture(gesture) {
+/**
+ * 处理一次手势：取词 → 弹菜单。
+ *
+ * @param gesture - 手势（含落点）。
+ * @param isCurrent - 这次手势是不是最新的（取词期间用户有没有又划一次）。
+ */
+async function handleGesture(gesture, isCurrent) {
   state.lastGesture = { ...gesture, at: Date.now() }
   if (inRect(gesture, menu.rect) || inRect(gesture, panel.rect)) return
   const text = await captureSelection(api, {
-    onSkip: (reason) => {
-      state.lastCapture = { ok: false, reason, at: Date.now() }
+    checkOwner: OWNER_CHECK,
+    onReport: (report) => {
+      state.lastCapture = report
     },
   })
   if (text === null || text.trim() === '') return
   const clamped = clampSelection(text, MAX_TEXT)
   if (clamped === '') return
-  state.lastCapture = { ok: true, length: clamped.length, at: Date.now() }
+  if (!isCurrent()) {
+    // 取词期间用户又划了一次：这次的结果过期了，绝不能拿它弹菜单——
+    // 否则菜单/回答窗口里的文字跟用户选的那段对不上（老实现就是这么串台的）。
+    if (state.lastCapture !== null) state.lastCapture.superseded = true
+    return
+  }
   // 只弹菜单：回答窗口与悬浮球不受影响
   showMenu(clamped, gesture.x, gesture.y)
 }
 
 /** 鼠标轮询：手势检测 + 任意键点到别处收起菜单 + Esc 收起菜单。 */
 function startHook() {
+  // 取词要注入 Ctrl+C 并读同一个全局剪贴板：两次取词必须串行，且只有最新那次手势作数。
+  // 重叠取词（后一次注入被前一次轮询读到、前一次的还原落在后一次的窗口里）正是
+  // "回答窗口的内容跟选中文字不符"的根因，见 gesture.mjs 的 createLatestQueue。
+  gestureQueue = createLatestQueue({
+    run: (gesture, seq) => handleGesture(gesture, () => gestureQueue.isLatest(seq)),
+    onError: (error) => reportError('gesture', error),
+  })
   const detector = createGestureDetector({
     onGesture: (gesture) => {
-      void handleGesture(gesture).catch((error) => reportError('gesture', error))
+      gestureQueue.submit(gesture)
     },
   })
   const buttons = { left: false, right: false, middle: false }
@@ -778,6 +819,7 @@ const server = createServer((req, res) => {
       },
       lastGesture: state.lastGesture,
       lastCapture: state.lastCapture,
+      gestures: gestureQueue === null ? null : gestureQueue.stats(),
       lastMenuDismiss: state.lastMenuDismiss ?? null,
       context: {
         enabled: contextReader !== null,
@@ -848,8 +890,9 @@ const server = createServer((req, res) => {
           const scale = menuWindow.scale()
           const row = menuRowAt(cssX, cssY)
           if (row >= 0) {
+            const selection = menu.selection
             hideMenu('item-click')
-            startRun(row === 0 ? 'explain' : 'translate')
+            startRun(row === 0 ? 'explain' : 'translate', selection)
           }
           respondJson(res, 200, { ok: true, target, row })
           return

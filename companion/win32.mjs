@@ -173,6 +173,11 @@ export function createWin32(hints = []) {
   api.GetClipboardData = user32.func('void *GetClipboardData(unsigned int uFormat)')
   api.SetClipboardData = user32.func('void *SetClipboardData(unsigned int uFormat, void *hMem)')
   api.GetClipboardSequenceNumber = user32.func('unsigned long GetClipboardSequenceNumber()')
+  // 剪贴板属主窗口：用来判断"这次写入是不是前台应用自己干的"（取词只认它）。
+  api.GetClipboardOwner = user32.func('void *GetClipboardOwner()')
+  // 顶层祖先窗口：UWP 这类应用里，前台是框架窗口（ApplicationFrameHost），真正处理
+  // Ctrl+C 的窗口是它的子窗口、属于另一个进程——按"根窗口的进程"能把它们认成一家。
+  api.GetAncestor = user32.func('void *GetAncestor(void *hwnd, unsigned int gaFlags)')
   api.GlobalLock = kernel32.func('void *GlobalLock(void *hMem)')
   api.GlobalUnlock = kernel32.func('bool GlobalUnlock(void *hMem)')
   api.GlobalSize = kernel32.func('size_t GlobalSize(void *hMem)')
@@ -199,6 +204,8 @@ export const WIN = {
   VK_C: 0x43,
   VK_ESCAPE: 0x1b,
   VK_MENU: 0x12,
+  /** GetAncestor 的 GA_ROOT（取顶层祖先窗口）。 */
+  GA_ROOT: 2,
   KEYEVENTF_KEYUP: 0x0002,
   CF_TEXT: 1,
   CF_UNICODETEXT: 13,
@@ -375,6 +382,38 @@ export function findWindowByTitlePrefix(api, prefix) {
     api.koffi.unregister(callback)
   }
   return found
+}
+
+/** 某个虚拟键此刻是否按着（GetAsyncKeyState 的最高位；读不到按"没按"处理）。 */
+export function keyDown(api, vk) {
+  try {
+    return (Number(api.GetAsyncKeyState(vk)) & 0x8000) !== 0
+  } catch {
+    return false
+  }
+}
+
+/** 剪贴板属主窗口（没人认领时返回 null）。 */
+export function clipboardOwnerWindow(api) {
+  try {
+    if (typeof api.GetClipboardOwner !== 'function') return undefined
+    const owner = api.GetClipboardOwner()
+    if (owner === null || owner === undefined || owner === 0) return null
+    return owner
+  } catch {
+    return undefined
+  }
+}
+
+/** 窗口的顶层祖先（GetAncestor(GA_ROOT)）；读不到返回 null。 */
+export function rootWindow(api, hwnd) {
+  try {
+    if (typeof api.GetAncestor !== 'function') return null
+    const root = api.GetAncestor(hwnd, WIN.GA_ROOT)
+    return root === null || root === undefined || root === 0 ? null : root
+  } catch {
+    return null
+  }
 }
 
 /** 窗口所属进程 pid。 */
