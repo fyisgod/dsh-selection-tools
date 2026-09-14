@@ -1,9 +1,20 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 
 import { createCompanionManager } from '../src/companion.ts'
+
+/**
+ * Node 22 的 test runner 在"事件循环里只剩 unref 定时器"时会认定循环已结束，
+ * 把还在等待的用例判成 cancelledByParent（"Promise resolution is still pending
+ * but the event loop has already resolved"）——而管理器**刻意** unref 掉自己的每个
+ * 定时器（不拖住宿主进程），假伴生进程（ZombieChild）又不带任何真实句柄，
+ * 于是重启用例的 await 没有东西撑着，CI（node-version: 22）上必红。
+ * 挂一个 ref'd 句柄，让 runner 一直等到用例自己跑完。
+ */
+const keepAlive = setInterval(() => {}, 1000)
+after(() => clearInterval(keepAlive))
 
 /**
  * 伴生进程管理器的生命周期：**重启必须只留下一个伴生进程**。
