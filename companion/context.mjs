@@ -1,5 +1,8 @@
 /**
- * 上下文读取（UI Automation）的主进程侧。
+ * 选区与上下文读取（UI Automation）的主进程侧。
+ *
+ * 除了「选区所在的段落」，worker 还负责**读选区本身**（probe）——那是划词的主取词
+ * 路径，全程不碰剪贴板；剪贴板只在 probe 读不到时才作为兜底（见 main.mjs）。
  *
  * 两个刻意的设计：
  * 1. **跑在 worker 线程里**：UIA 是同步 COM，目标应用无响应时会把调用线程一起卡住。
@@ -21,7 +24,7 @@ export function createContextReader(options = {}) {
   let worker = null
   let seq = 0
   let inflight = null
-  const stats = { reads: 0, ok: 0, timeouts: 0, errors: 0, restarts: 0 }
+  const stats = { reads: 0, probes: 0, ok: 0, timeouts: 0, errors: 0, restarts: 0 }
 
   /** 结束（或丢弃）当前在途请求；结果一律是"没有上下文"而不是抛错。 */
   function settle(result, reason) {
@@ -99,6 +102,22 @@ export function createContextReader(options = {}) {
     read(point, expected) {
       stats.reads++
       return request('read', { point, expected }).then((result) => {
+        if (result !== null) stats.ok++
+        return result
+      })
+    },
+    /**
+     * 探一次：选区文本 + 选区所在段落（**不注入按键、不碰剪贴板**）。
+     *
+     * 这是划词的主取词路径：菜单弹出时先探一次（读到选区就顺带拿到上下文），
+     * 点菜单项时如果还没读到，再补探一次（那时无障碍树已经热了）。
+     * @param point - 手势落点（屏幕物理坐标）。
+     * @param options.retries - 读不到时在 worker 里重试几次（默认 2；补读时给 0）。
+     * @returns `{ selection, unit, text, ... }` / `null`，语义见 uia.mjs 的 probe()。
+     */
+    probe(point, options = {}) {
+      stats.probes++
+      return request('probe', { point, retries: options.retries }).then((result) => {
         if (result !== null) stats.ok++
         return result
       })

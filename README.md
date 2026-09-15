@@ -12,7 +12,7 @@ Select text in any Windows app — the Harness agent explains or translates it i
 
 ---
 
-> 🌐 **English** — an official-form DSH **bundle plugin** for Windows: select text in *any* app and explain/translate it with DeepSeek Harness's own agent (the surrounding paragraph is read with UI Automation and sent along as context). The answer renders in a native GDI+ always-on-top window — no browser, no extra process, no runtime dependency. Quickstart:
+> 🌐 **English** — an official-form DSH **bundle plugin** for Windows: select text in *any* app and explain/translate it with DeepSeek Harness's own agent. The menu pops the moment you select — **selecting never touches your clipboard**: the selected text and its surrounding paragraph are read with UI Automation, and the clipboard (one injected Ctrl+C) is only used as a fallback *after* you click a menu item. The answer renders in a native GDI+ always-on-top window — no browser, no extra process, no runtime dependency. Quickstart:
 > ```sh
 > dsh plugin --profile web add "github:fyisgod/dsh-selection-tools"
 > ```
@@ -21,10 +21,11 @@ Select text in any Windows app — the Harness agent explains or translates it i
 ## 它做什么
 
 - **系统级划词**（主路径）：在**任何 Windows 应用**里拖选或双击选词 → 以选区右下角为锚点、第四象限弹出菜单（`DeepSeek Harness 解释` / `DeepSeek Harness 翻译`）→ 点击后弹出置顶悬浮窗，流式显示 Harness agent 的回答。
+- **划词不碰剪贴板**：菜单在手势落下的那一刻就弹（不再"先注入 Ctrl+C 取词、取到才弹"——那条路上取词失败就等于菜单呼不出来）；选中的文字留到**点菜单项时**才解析，先走 UI Automation 直接读选区，只有它读不到才注入一次 Ctrl+C 读剪贴板兜底。
 - **菜单与回答窗口彼此独立**：划词菜单有显示时限（默认 **3.6 秒**），超时、按 Esc、或用**任意鼠标键**点到别处都会收起；回答窗口**只有手动关闭（标题栏 ✕）才会消失**——新划词不会动它，**窗口里的内容也只在点菜单的解释/翻译时才会换**（再选一段文字、点窗口、滚轮都不会把结果顶掉）。
 - **标题栏三个按钮**（从右往左：关闭 / 复制 / 朗读）：**复制**把回答写进剪贴板，页脚回执「已复制 / 复制失败」；**朗读**用 Windows 自带的语音（SAPI，进程内 COM，不起额外进程）念出选中的原文，再点一次就停，读完自动复原；没有内容可复制/没有原文可读时对应图标画成灰的。
 - **翻译会分情况给结果**（由翻译规则驱动，可改）：选中的是**词/短语**时按词典条目输出——**最佳翻译**、**音标**（英/美）、**其他翻译**（带词性与使用场景）、关键术语或缩写再给**术语说明**；选中的是**句子/段落**时先给整段译文，若句中出现关键术语、缩写或专有名词，再追加**关键术语**小节逐条解释。
-- **自动带上上下文**（像知乎的划词解释）：菜单弹出后用 UI Automation 读"选区所在的那个段落"，点解释/翻译时连同上文一起交给 agent，回答落在语境里而不是孤立地解释一个词；读不到（应用不暴露 UIA 文本）就安静降级为只送选区。
+- **自动带上上下文**（像知乎的划词解释）：手势落下后立刻用 UI Automation 读"选区 + 选区所在的那个段落"（一次读完），点解释/翻译时连同上文一起交给 agent，回答落在语境里而不是孤立地解释一个词；读不到（应用不暴露 UIA 文本）就安静降级为只送选区，再读不到才退到剪贴板。
 - **页内划词**（保底路径）：同一套菜单/悬浮窗也注册在 DSH 的 `shell.overlay` 槽位里；系统级能力不可用时（没装 koffi、被显式关闭）自动接管，DSH 页面内划词照常可用。
 - **设置页**：在 DSH 的「设置 → 划词工具」里改默认翻译语言、反向目标语言、解释/翻译规则（直接进提示词）、以及翻译与解释各自使用的模型 + 推理等级；改完立即生效（存在 `DSH_HOME/dsh-selection-tools.json`）。
 - **回答由 Harness agent 生成**：插件不自己调模型——宿主半边用 `ctx.agents` 跑一轮**真实会话回合**（同一套 agent loop、系统提示、工具、模型 route），每次划词都是一条全新会话。
@@ -60,9 +61,9 @@ Select text in any Windows app — the Harness agent explains or translates it i
 ```
 ┌─ DSH 进程 ───────────────────────────────┐      ┌─ 伴生进程（Node + koffi + GDI+） ────────┐
 │ dsh-selection-tools（Cordis 插件）        │      │ 全局鼠标轮询 → 拖选 / 双击手势          │
-│  · /api/dsh-selection-tools/run  (SSE)   │◀─────│ 剪贴板取词（注入一次 Ctrl+C）           │
+│  · /api/dsh-selection-tools/run  (SSE)   │◀─────│ UIA 读选区+段落（不碰剪贴板）            │
 │  · /api/dsh-selection-tools/stop         │ HTTP │ 原生分层窗口：菜单 / 回答窗口            │
-│                                          │◀─────│ UIA 读选区所在段落（worker + 超时）      │
+│                                          │◀─────│ 点菜单项仍读不到才注入 Ctrl+C 兜底       │
 │  · /api/dsh-selection-tools/system/*     │      │ GDI+ 自绘（圆角卡片、字体、markdown-lite）│
 │  · ctx.agents 跑真实会话回合              │      └─────────────────────────────────────────┘
 └──────────────────────────────────────────┘
@@ -78,10 +79,10 @@ Select text in any Windows app — the Harness agent explains or translates it i
 | 能力 | 说明 |
 | --- | --- |
 | 系统级手势检测（伴生进程） | 轮询左键状态与光标位置识别"拖选（位移 ≥5px）"与"双击选词（420ms/6px 内两次）"；落在浮层自己身上的点击忽略。 |
-| 取词（伴生进程） | 注入一次 Ctrl+C 后读剪贴板（**用剪贴板序号变化判定是否真的复制成功**，并核对这次写入不是别的进程写的），随后把用户原来的剪贴板内容还原；**用户正按着 Ctrl+C、或用户在取词期间自己复制过，就一个字节都不碰剪贴板**；控制台/终端窗口默认跳过（Ctrl+C 在那里是中断）。取词的取舍每次都会记进 `/status` 的 `lastCapture`。 |
+| 取词（伴生进程） | **主路径是 UI Automation**：手势落下就一次读完"选中的文字 + 它所在的段落"，全程不注入按键、不碰剪贴板。只有 UIA 读不到（应用不暴露文本、超时）才退到剪贴板兜底——那次注入 Ctrl+C 会**用剪贴板序号变化判定是否真的复制成功**，并核对这次写入不是别的进程写的，随后把用户原来的剪贴板内容还原；**用户正按着 Ctrl+C、或用户在取词期间自己复制过，就一个字节都不碰剪贴板**；控制台/终端窗口默认跳过（Ctrl+C 在那里是中断）。取词的取舍每次都会记进 `/status` 的 `lastCapture` 与 `lastResolve`。 |
 | 原生浮层（伴生进程） | 自己创建 `WS_POPUP` + `WS_EX_LAYERED|TOPMOST|TOOLWINDOW|NOACTIVATE` 窗口，GDI+ 画一帧到 32bpp DIB，`UpdateLayeredWindow` 带 alpha 贴屏；无边框、置顶、不抢焦点。 |
 | 交互 | 标题栏拖动、**四边四角缩放**（八个方向都能用鼠标拉，指针会变成对应的双箭头）、菜单两项 hover/点击、回答窗口的复制/关闭/停止、滚轮滚动、全局 Esc 收起菜单。 |
-| 上下文（伴生进程） | 菜单弹出后用 UI Automation 读选区所在的**段落**（TextUnit_Paragraph），并用剪贴板文本校验 UIA 选区没串台；候选元素按"点上的元素 → 逐级祖先 → 焦点元素 → 逐级祖先"找（浏览器里点上的常常只是外壳），**第一次读不到会等 160ms 再读**（Chromium 这类应用是被 UIA 问到才打开无障碍树，冷启动第一次必失败）；读不到/超时/串台一律按"没有上下文"处理。 |
+| 选区 + 上下文（伴生进程） | 手势落下后用 UI Automation 一次读完**选区**与选区所在的**段落**（TextUnit_Paragraph）；候选元素按"点上的元素 → 逐级祖先 → 焦点元素 → 逐级祖先"找（浏览器里点上的常常只是外壳），**第一次读不到会等 160ms 再读**（Chromium 这类应用是被 UIA 问到才打开无障碍树，冷启动第一次必失败——实测 DSH 桌面端自己的 WebView2 窗口也一样）；读不到/超时一律按"没有选区"处理，交给点菜单项之后的解析链继续。 |
 | 朗读（伴生进程） | 进程内 COM 调 `ISpVoice`（`Speak` 异步 + `WaitUntilDone(0)` 轮询"还在读吗"），读的是选中的原文；面板关闭、开始新一轮、再点一次都会停。 |
 | `POST /api/dsh-selection-tools/run` | 同源 JSON 进、**SSE 出**（`session`/`delta`/`done`/`error`），内部跑真实 agent 回合。 |
 | `POST /api/dsh-selection-tools/stop` | 停止当前一轮，走官方 `agent.cancel({ kind: 'user' })`。 |
@@ -128,9 +129,9 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 
 ## 使用
 
-1. **任意应用**里选中文字（拖选 / 双击选词）。
-2. 选区右下角弹出菜单，点 **解释** 或 **翻译**（Esc 可收起）。
-3. 回答窗口在屏幕右下角打开并流式显示结果（带着选区所在的上下文一起问）；生成中可 **停止**，完成后可 **复制** 或 **关闭**（✕）；**标题栏可拖动，四条边与四个角都能用鼠标拖着改大小**（指针会变成对应的双箭头）。
+1. **任意应用**里选中文字（拖选 / 双击选词）——这一步不碰剪贴板。
+2. 选区右下角弹出菜单（大约几十毫秒后就可见；`DSH_SELECTION_MENU_DECIDE_MS` 说明见下），点 **解释** 或 **翻译**（Esc 可收起）。
+3. 回答窗口先显示「正在读取选区…」，随即流式显示结果（带着选区所在的上下文一起问）；生成中可 **停止**，完成后可 **复制** 或 **关闭**（✕）；**标题栏可拖动，四条边与四个角都能用鼠标拖着改大小**（指针会变成对应的双箭头）。取不到选中的文字时会显示「失败 · 未能读取选中的文字」，而不是"点了没反应"。
 
 翻译方向自动判定：源文本含中日韩字符 → 译成英文；否则译成中文。
 
@@ -142,13 +143,27 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 | `DSH_SELECTION_HOOK` | `1` | 伴生进程侧开关：`0` = 只起浮层不做全局手势检测。 |
 | `DSH_SELECTION_POLL_MS` | `40` | 鼠标轮询间隔（毫秒）。 |
 | `DSH_SELECTION_MAX_TEXT` | `12000` | 单次划词字符上限。 |
+| `DSH_SELECTION_MENU_DECIDE_MS` | `280` | 手势落下后给 UIA 的决策窗口：这么长时间内读到"有没有选中文字"就按它办（有选区 → 弹；**这一点上确实没有选区** → 不弹），超时/读不到就照弹（`0` = 手势一到就弹，不做任何过滤）。 |
+| `DSH_SELECTION_TEXT_SOURCE` | `auto` | 选区文字从哪来：`auto` = UIA 优先、读不到才用剪贴板；`uia` = 只用 UIA（读不到就报错，绝不碰剪贴板）；`clipboard` = 直接用剪贴板（某个应用 UIA 读得不准时的逃生舱）。 |
+| `DSH_SELECTION_MENU_PROBE_RETRIES` | `3` | 菜单弹出时 UIA 预读的重试次数（Chromium/WebView2 冷启动第一次必失败，重试同时替后面的解析把无障碍树焐热）。 |
+| `DSH_SELECTION_CLICK_PROBE_RETRIES` | `1` | 点菜单项时补读 UIA 的重试次数；再多只是拖延剪贴板兜底。 |
 | `DSH_SELECTION_CLIPBOARD_OWNER` | `1` | 取词时是否核对"这次剪贴板写入不是别的进程写的"；`0` = 退回老行为（只看序号变化）——核对误伤了某个应用、取不到词时才关。 |
 | `DSH_SELECTION_MENU_TIMEOUT_MS` | `3600` | 划词菜单的显示时限（毫秒）。 |
+| `DSH_SELECTION_CONTEXT` | `1` | UI Automation 开关；`0` = 关掉"读选区 + 读段落"（菜单不再过滤手势，选区只能走剪贴板兜底，等于退回老行为）。 |
+| `DSH_SELECTION_CONTEXT_TIMEOUT_MS` | `1800` | 单次 UIA 读取的时间预算；超时直接丢掉 worker。 |
 | `DSH_SELECTION_LOCALE` | 由插件传入 | 回答语言提示（`zh`/`en`）。 |
 | `DSH_SELECTION_DSH_ORIGIN` | `http://127.0.0.1:3080` | 伴生进程调用 DSH 路由的地址（插件自动传对）。 |
 
 ## 设计要点（含踩过的坑）
 
+- **菜单绝不能等取词**：老实现是「手势 → 注入 Ctrl+C 读剪贴板 → 读到了才弹菜单」，于是**取词失败就等于菜单呼不出来**——DSH 桌面端自己的 WebView2 窗口里注入的 Ctrl+C 拿不到剪贴板（实测 `/status` 里 `lastCapture.reason = timeout`，剪贴板序号变了却读不出文字），个别外部应用也偶发。它还会短暂接管用户的剪贴板。现在手势落下就弹菜单，弹出条件里再也没有「能不能取到词」这一项；代价是要自己回答「这次拖拽/双击到底是不是在选文字」，用 UIA 回答（`companion/policy.mjs` 的 `menuDecision`）：
+  - 读到选区里有文字 → 弹；
+  - 这一点上的元素带 TextPattern 却没有任何选区 → **不弹**（拖窗口、拖滑块、双击图标都不该弹）；
+  - 什么都没读到（应用不暴露 UIA 文本、超时）→ **照弹**：未知时倒向"用户确实想划词"，点菜单项时还有剪贴板兜底。
+  这三条都有单测钉着（`test/policy.test.mjs`），决策理由每次写进 `/status` 的 `lastMenuDecision`。
+- **选区文字 UIA 优先、剪贴板垫底**：点菜单项时才解析选区——先等菜单弹出时就开始的 UIA 预读（一次调用同时拿到**选区**与**段落**），再补读一次（那时无障碍树已热），最后才注入 Ctrl+C 读剪贴板。**全插件只有这最后一处会碰用户的剪贴板**，而且只在用户点了菜单按钮之后、前两条都拿不到文字时。`/status` 的 `lastResolve.source` 会说清这次用的是哪一条（`uia-prefetch` / `uia-fresh` / `preset` / `clipboard`）。
+  - 顺带一个观察：Chromium（含 DSH 桌面端自己的 WebView2 窗口）是**被 UIA 问到才打开无障碍树**，刚启动那一下连 TextPattern 都还没有（实测：本轮第一次划词的 3 次尝试全空，之后再问就正常）。所以预读的重试次数比决策窗口长——它在替"点菜单项时"把树焐热；读不到时决策会走"未知 → 照弹"，用户不会因此丢菜单。
+- **注入按键要带扫描码**：`keybd_event` 的 `bScan` 传 0 时，Chromium/WebView2 一类窗口可能不认这次合成按键，剪贴板一动都不动。兜底取词现在用 `MapVirtualKeyW` 补上扫描码，那条路才真的能兜底。
 - **agent 一致性靠复用**：`ctx.agents.create` + `agent.followup` + `agent.whenIdle`，最终文本取自语料权威来源（会话日志里最后一条 `assistant/message`）。
 - **user 消息必须带稳定 `id` 与 `source.rpcId`**：缺失会让会话在 DSH 对话视图里报 `received more than one start Match`。
 - **会话必须带 `cwd`**：没有工作目录的会话上跑 agent 会静默无输出。
@@ -191,7 +206,8 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 
 ## 风险与边界
 
-- **取词会短暂接管剪贴板**（注入 Ctrl+C 读剪贴板，随后把原内容写回）：用户此刻正按着 Ctrl+C、或取词期间用户自己复制过，则完全不碰剪贴板；取词期间别人写的剪贴板内容不会被当成选区；控制台/终端窗口默认跳过。
+- **划词本身不碰剪贴板**：选中的文字优先用 UI Automation 读。只有在**点了菜单项之后** UIA 仍读不到时，才会注入一次 Ctrl+C 读剪贴板（随后把原内容写回）——那一次里，用户此刻正按着 Ctrl+C、或期间用户自己复制过，则完全不碰剪贴板；期间别人写的内容不会被当成选区；控制台/终端窗口默认跳过。想要连兜底都不发生，设 `DSH_SELECTION_TEXT_SOURCE=uia`。
+- **UIA 读到的选区可能来自焦点元素**：为了覆盖"浏览器里点上的只是外壳"这类情况，候选链会退到焦点元素的选区。极端情况下（页面里留着旧选区、又去拖浏览器标题栏）可能弹出一个带着旧选区的菜单——按 `Esc` 或点别处即收起，嫌吵就把 `DSH_SELECTION_MENU_DECIDE_MS` 调大（决策更有把握）或设 `DSH_SELECTION_TEXT_SOURCE=clipboard` 退回老行为。
 - **只支持 Windows**：Win32 + GDI+ 专用；其它平台退化为页内划词路径。
 - 浮层是**原生自绘**：markdown 支持标题/列表/引用/代码块/粗体/行内码/表格（表格按等宽行排版），不追求浏览器级的排版细节；正文不可选中，复制用面板上的复制按钮。
 - 划词长度上限 12000 字符；超出直接报错，而不是把整篇文档塞给模型。
@@ -204,7 +220,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 pnpm install
 pnpm build          # tsdown：lib/index.js + lib/client.js
 pnpm typecheck
-pnpm test           # 单测（node --test）：手势状态机与串行队列 + 剪贴板取词竞态 + 八向缩放命中区 + 伴生进程生命周期
+pnpm test           # 单测（node --test）：手势状态机与串行队列 + 弹菜单/取词策略 + 剪贴板兜底取词竞态 + 八向缩放命中区 + 伴生进程生命周期
 pnpm verify:screenshots   # 校验 screenshots.json 里列的图确实在仓库里
 
 # 页内路径验收（需要本机 Chrome + 跑着的 dsh web；默认打 http://127.0.0.1:3080）
@@ -214,7 +230,9 @@ node scripts/verify-ui.cjs
 
 `screenshots.json`（仓库根）决定**插件市场详情页**展示哪些截图、按什么顺序展示——1–8 张，路径相对该文件本身。图片都在 `docs/`：换图推自己的仓库即可，下次构建自动生效；`pnpm verify:screenshots`（CI 也跑）防止改名后清单指向不存在的文件。
 
-系统级浮层的验收不需要动真实鼠标：伴生进程自带调试端点（`/simulate` `/click` `/wheel` `/hittest` `/capture`）。
+系统级浮层的验收不需要动真实鼠标：伴生进程自带调试端点（`/simulate` `/click` `/wheel` `/hittest` `/capture` `/probe`）。
+
+`/probe` 是这次改动的排障入口：给一个屏幕坐标，直接看 UIA 在这一点上读到了什么、菜单会不会弹（"划不出来"时先问它）。
 
 ```sh
 # 1. 让浮层出现在指定屏幕坐标（等价于"在那里划了词"）
@@ -231,6 +249,9 @@ curl -X POST http://127.0.0.1:<companionPort>/capture -H "content-type: applicat
 # 5. 命中测试：某个 DIP 坐标落在哪个区、会回给 Windows 哪个 HT 代码（八向缩放就靠这张表）
 # 左边中点 → {"zone":"resize-left","code":10}；code 10/11/12/15 = 左/右/上/下，13/14/16/17 = 四个对角
 curl -X POST http://127.0.0.1:<companionPort>/hittest -H "content-type: application/json" -d '{"x":2,"y":240}'
+# 6. 探针：这个屏幕坐标上 UIA 读到了什么、菜单会不会弹（"划不出来"时先问它）
+# decision.reason 的取值：selection（有选区）/ no-selection（确实没在选文字）/ unknown（读不到，照弹）/ timeout（没在决策窗口内读到，照弹）
+curl -X POST http://127.0.0.1:<companionPort>/probe -H "content-type: application/json" -d '{"x":-500,"y":600}'
 ```
 
 | 路径 | 作用 |
@@ -240,10 +261,11 @@ curl -X POST http://127.0.0.1:<companionPort>/hittest -H "content-type: applicat
 | `src/prompt.ts` | 翻译 / 解释的提示词与目标语言判定。 |
 | `src/shared/protocol.ts` | 跨半边协议：路由前缀、请求体、SSE 帧。 |
 | `src/client/index.tsx` / `overlay.tsx` / `styles.ts` / `api.ts` | 页内划词菜单 + 悬浮窗（React + 官方槽位）。 |
-| `companion/main.mjs` | 伴生进程主体：轮询、取词、原生浮层编排、本地 HTTP。 |
+| `companion/main.mjs` | 伴生进程主体：轮询、弹菜单决策、点菜单项后的取词链、原生浮层编排、本地 HTTP。 |
 | `companion/win32.mjs` | koffi/Win32 绑定（鼠标、剪贴板、窗口、DPI、显示器）。 |
 | `companion/gesture.mjs` | 手势状态机 + 手势串行队列（纯函数，可单测）。 |
-| `companion/selection.mjs` | 剪贴板取词：终端跳过、只丢"别的进程写的"那次、还原只在无人再写时做。 |
+| `companion/policy.mjs` | 纯策略（可单测）：菜单该不该弹（`menuDecision`）、这次用哪个来源的文字（`pickSelection`）。 |
+| `companion/selection.mjs` | 剪贴板兜底取词：终端跳过、只丢"别的进程写的"那次、还原只在无人再写时做。 |
 | `companion/native/window.mjs` | 原生分层窗口 + WndProc + PeekMessage 消息泵 + 拖动/八向缩放命中与光标。 |
 | `companion/native/gdi.mjs` | GDI+ 绑定与画笔（圆角、文字、测量、CJK/粗体断行排版）。 |
 | `companion/native/ui.mjs` | 三种形态的布局、绘制、命中测试（含四边四角的缩放手柄）与 markdown-lite。 |

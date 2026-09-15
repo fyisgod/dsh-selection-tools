@@ -251,8 +251,26 @@ export function paintPanel(painter, width, height, state, scale) {
   // 先铺一层底色再分隔线：即使有溢出也不会在页脚区域看到正文残影
   painter.fillRect(0, footerTop * s, width, (dipHeight - footerTop) * s, p.menuColor)
   painter.line(0, footerTop * s, width, footerTop * s, p.dividerColor, 1)
-  const statusText = state.status === 'running' ? 'Harness agent 生成中…' : state.status === 'done' ? '完成' : state.status === 'error' ? '失败' : '就绪'
-  const statusColor = state.status === 'running' ? p.accentColor : state.status === 'done' ? p.successColor : state.status === 'error' ? p.dangerColor : p.labelTertiaryColor
+  // 'reading'：点了菜单项、正在解析选中的文字（UIA 优先，读不到才走剪贴板兜底）——
+  // 这一步最长会花上一次取词的时间，必须让用户看见"点了有反应"。
+  const statusText =
+    state.status === 'running'
+      ? 'Harness agent 生成中…'
+      : state.status === 'reading'
+        ? '正在读取选区…'
+        : state.status === 'done'
+          ? '完成'
+          : state.status === 'error'
+            ? '失败'
+            : '就绪'
+  const statusColor =
+    state.status === 'running' || state.status === 'reading'
+      ? p.accentColor
+      : state.status === 'done'
+        ? p.successColor
+        : state.status === 'error'
+          ? p.dangerColor
+          : p.labelTertiaryColor
   painter.fillCircle(PANEL.padding * s, (footerTop + 14) * s, 6 * s, statusColor)
   painter.text(statusText, (PANEL.padding + 12) * s, (footerTop + 8) * s, 150 * s, 18 * s, { size: 12 * s, color: state.status === 'error' ? p.dangerColor : p.labelTertiaryColor })
   if (state.status === 'error' && state.error !== '') {
@@ -277,7 +295,7 @@ export function paintPanel(painter, width, height, state, scale) {
 /** 画答案（markdown-lite），返回内容高度（物理像素）。 */
 function drawAnswer(painter, state, x, y, width, s, p, clipTop, clipBottom) {
   if (state.answer === '') {
-    if (state.status === 'running') {
+    if (state.status === 'running' || state.status === 'reading') {
       painter.fillRect(x, y + 3 * s, 6 * s, 15 * s, p.labelTertiaryColor)
       return y + 22 * s - (clipTop - state.scroll * s)
     }

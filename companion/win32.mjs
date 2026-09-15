@@ -163,6 +163,7 @@ export function createWin32(hints = []) {
   api.GetMonitorInfoW = user32.func('bool GetMonitorInfoW(void *hMonitor, _Inout_ DST_MONITORINFO *info)')
   api.GetSystemMetrics = user32.func('int GetSystemMetrics(int nIndex)')
   api.keybd_event = user32.func('void keybd_event(uint8_t bVk, uint8_t bScan, unsigned int dwFlags, uintptr_t dwExtraInfo)')
+  api.MapVirtualKeyW = user32.func('unsigned int MapVirtualKeyW(unsigned int uCode, unsigned int uMapType)')
   api.FindWindowW = user32.func('void *FindWindowW(const char16_t *lpClassName, const char16_t *lpWindowName)')
   // EnumWindows 需要一个真正的回调原型：koffi 不接受裸的 'bool __stdcall(void*, intptr_t)' 字符串。
   api.EnumWindowsProc = koffi.proto('bool __stdcall DstEnumWindowsProc(void *hwnd, intptr_t lParam)')
@@ -468,12 +469,31 @@ export function writeClipboardText(api, text) {
   }
 }
 
-/** 注入 Ctrl+<key>（默认 Ctrl+C）：与真实按键同样的路径，前台应用无法区分。 */
+/** 虚拟键 → 扫描码（拿不到返回 0）。 */
+function scanCode(api, vk) {
+  try {
+    if (typeof api.MapVirtualKeyW !== 'function') return 0
+    // MAPVK_VK_TO_VSC = 0；只要低字节（keybd_event 的 bScan 是 BYTE）。
+    return Number(api.MapVirtualKeyW(vk, 0)) & 0xff
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * 注入 Ctrl+<key>（默认 Ctrl+C）：与真实按键同样的路径，前台应用无法区分。
+ *
+ * 扫描码必须补上：相当一部分应用（Chromium/WebView2 一类的窗口，也就是 DSH 桌面端自己）
+ * 对"没有扫描码的合成按键"不认，注入的 Ctrl+C 进不去，剪贴板一动不动——补上之后这条路
+ * 才真的能兜底。
+ */
 export function sendCopyShortcut(api, key = WIN.VK_C) {
-  api.keybd_event(WIN.VK_CONTROL, 0, 0, 0)
-  api.keybd_event(key, 0, 0, 0)
-  api.keybd_event(key, 0, WIN.KEYEVENTF_KEYUP, 0)
-  api.keybd_event(WIN.VK_CONTROL, 0, WIN.KEYEVENTF_KEYUP, 0)
+  const control = scanCode(api, WIN.VK_CONTROL)
+  const scan = scanCode(api, key)
+  api.keybd_event(WIN.VK_CONTROL, control, 0, 0)
+  api.keybd_event(key, scan, 0, 0)
+  api.keybd_event(key, scan, WIN.KEYEVENTF_KEYUP, 0)
+  api.keybd_event(WIN.VK_CONTROL, control, WIN.KEYEVENTF_KEYUP, 0)
 }
 
 /** 去掉标题栏（保留可缩放边框），使其看起来像浮层而不是普通窗口。 */

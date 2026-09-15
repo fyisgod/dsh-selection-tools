@@ -39,13 +39,18 @@ parentPort?.on('message', async (message) => {
       parentPort.postMessage({ id, result: api.diagnose(message.point) })
       return
     }
-    let result = api.read(message.point, message.expected)
-    // 关键：**第一次 UIA 查询往往读不到**——Chromium 这类应用是"被 UIA 问到才打开
-    // 无障碍树"，冷启动那一刻 TextPattern 还不存在（实测：第 0 次 no text pattern，
-    // 第 1 次开始 selection/paragraph 都正常）。所以第一次空了就等一会儿再读。
-    for (let attempt = 1; attempt <= RETRIES && result === null; attempt++) {
+    const call = () =>
+      message?.type === 'probe' ? api.probe(message.point) : api.read(message.point, message.expected)
+    // 重试次数由主进程按场景给（默认 2 次）：
+    // - 菜单弹出时的预读：Chromium 这类应用是"被 UIA 问到才打开无障碍树"，冷启动那一刻
+    //   TextPattern 还不存在（实测：第 0 次 no text pattern，第 1 次开始都正常），所以要重试；
+    // - 点菜单项时的补读（0 次）：那时无障碍树已经热了，读不到就是真读不到——不能在这里
+    //   再等 320ms 才退到剪贴板兜底。
+    const retries = Number.isFinite(message?.retries) ? Math.max(0, Math.trunc(Number(message.retries))) : RETRIES
+    let result = call()
+    for (let attempt = 1; attempt <= retries && result === null; attempt++) {
       await sleep(RETRY_GAP_MS)
-      result = api.read(message.point, message.expected)
+      result = call()
     }
     parentPort.postMessage({ id, result })
   } catch (error) {

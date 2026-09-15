@@ -261,26 +261,31 @@ export function createUiaReader(koffi) {
   }
 
   /**
-   * 候选元素列表：点上的元素 → 逐级祖先 → 焦点元素 → 逐级祖先。
+   * 候选元素列表：点上的元素 → 逐级祖先（source='point'）→ 焦点元素 → 逐级祖先（source='focused'）。
    *
    * 为什么不能只看"点上的元素"：浏览器里点上拿到的常常是外壳（Chrome_WidgetWin_1），
    * TextPattern 挂在文档/文本控件上；反过来也有（点上是很细的文本叶子）。
    * 逐级向上找是成本最低、覆盖最广的做法。
-   * @returns 都是**新引用**，调用方负责 release。
+   *
+   * 为什么还要记来源：菜单弹不弹取决于"这一点上到底有没有选中文字"。点上的元素自己带
+   * TextPattern、却报不出任何选区，是"这里真的没在选文字"的强证据（拖窗口、拖滑块、
+   * 双击图标…）；只有焦点元素才读得到则证据很弱（也可能只是点在了外壳上），不能据此
+   * 把菜单吞掉。
+   * @returns `{ iface, source }[]`，都是**新引用**，调用方负责 release。
    */
   const candidates = (point) => {
     const list = []
-    const push = (start) => {
+    const push = (start, source) => {
       let node = start
       for (let level = 0; node !== null && level < 5; level++) {
-        list.push(node)
+        list.push({ iface: node, source })
         node = parentOf(node)
       }
     }
     const at = elementAt(point)
-    if (at !== null) push(at)
+    if (at !== null) push(at, 'point')
     const focused = focusedElement()
-    if (focused !== null) push(focused)
+    if (focused !== null) push(focused, 'focused')
     return list
   }
 
@@ -337,41 +342,87 @@ export function createUiaReader(koffi) {
   }
 
   /**
-   * 读取选区所在的上下文段落。
-   * @param point - 屏幕坐标（取词手势落点，物理像素）。
-   * @param expected - 剪贴板里拿到的选中文本（用于校验 UIA 的选区没串台）。
-   * @returns \`{ unit, text, selection, className }\`；读不到或校验不过返回 null。
+   * 在某个点上探一次：**选区文本 + 选区所在段落**一次读完。
+   *
+   * 全程只用 UIA——不注入按键、不碰剪贴板，所以它是划词的主取词路径；只有它读不到时
+   * 才轮到剪贴板兜底（那才是唯一会动剪贴板的地方）。
+   *
+   * @param point - 屏幕坐标（手势落点，物理像素）。
+   * @returns
+   *   - `null`：这一点上根本没有可读文本（应用不暴露 UIA 文本 / 读失败）——**不知道**
+   *     用户选没选文字，调用方按未知处理（菜单照弹，点下去再退到剪贴板）；
+   *   - `{ selection: '' }`：这一点上有 TextPattern 却没有选区——**确实没在选文字**；
+   *   - `{ selection: '...' }`：读到了选中的文字（`text`/`unit` 是它所在的段落，可能为空）。
    */
-  const read = (point, expected) => {
+  const probe = (point) => {
     const cleanup = []
     try {
       let seen = 0
-      for (const element of candidates(point)) {
+      /** 读到"有 TextPattern 但没有选区"时的兜底结果。 */
+      let empty = null
+      const blank = (iface, source) => ({
+        selection: '',
+        unit: '',
+        text: '',
+        className: String(property(iface, UIA_ClassNamePropertyId) || ''),
+        source,
+        candidates: seen,
+      })
+      for (const { iface, source } of candidates(point)) {
         seen += 1
-        cleanup.push(element)
-        const pattern = textPattern(element)
+        cleanup.push(iface)
+        const pattern = textPattern(iface)
         if (pattern === null) continue
         cleanup.push(pattern)
         const selection = rangesFor(pattern)
-        if (selection === null || selection.ranges.length === 0) continue
-        cleanup.push(...selection.ranges)
-        const current = selection.ranges[0]
+        const current = selection !== null && selection.ranges.length > 0 ? selection.ranges[0] : null
+        if (current === null) {
+          if (empty === null) empty = blank(iface, source)
+          continue
+        }
+        cleanup.push(current)
         const selected = rangeText(current)
-        if (expected !== undefined && expected !== null && !sameSelection(selected, expected)) continue
-        const found = contextFrom(element, current, selected, cleanup)
-        if (found !== null) return { ...found, candidates: seen }
+        if (selected.trim() === '') {
+          if (empty === null) empty = blank(iface, source)
+          continue
+        }
+        // 第一处真选区就收工：候选是按"最具体 → 最外层"排的，再往下只会更粗。
+        const found = contextFrom(iface, current, selected, cleanup)
+        return {
+          selection: selected,
+          unit: found === null ? '' : found.unit,
+          text: found === null ? '' : found.text,
+          className: found === null ? String(property(iface, UIA_ClassNamePropertyId) || '') : found.className,
+          source,
+          candidates: seen,
+        }
       }
-      return null
+      return empty
     } finally {
       for (const iface of cleanup.reverse()) release(iface)
     }
   }
 
+  /**
+   * 读取选区所在的上下文段落（/context 路由与验收脚本用的老接口）。
+   * @param point - 屏幕坐标。
+   * @param expected - 期望的选中文本（给了就校验 UIA 选区没串台；不给就按读到的算）。
+   * @returns `{ unit, text, selection, className, candidates }`；读不到段落返回 null。
+   */
+  const read = (point, expected) => {
+    const result = probe(point)
+    if (result === null) return null
+    if (expected !== undefined && expected !== null && !sameSelection(result.selection, expected)) return null
+    if (result.unit === '' || result.text === '') return null
+    return { unit: result.unit, text: result.text, selection: result.selection, className: result.className, candidates: result.candidates }
+  }
+
   return {
+    probe,
     read,
     /** 诊断：这个点上能不能读文本、读到什么（验收脚本用）。 */
     diagnose(point) {
-      const report = { point, className: '', controlType: null, textPattern: false, selection: '', paragraph: '', error: '', candidates: 0, tried: 0 }
+      const report = { point, className: '', controlType: null, textPattern: false, source: '', selection: '', paragraph: '', error: '', candidates: 0, tried: 0 }
       let element = null
       let pattern = null
       const cleanup = []
@@ -379,13 +430,14 @@ export function createUiaReader(koffi) {
         const list = candidates(point)
         report.candidates = list.length
         // 沿候选链找第一个带 TextPattern 的元素（浏览器等应用的点上元素往往只是外壳）
-        for (const candidate of list) {
+        for (const { iface: candidate, source } of list) {
           report.tried += 1
           cleanup.push(candidate)
           const found = textPattern(candidate)
           if (found === null) continue
           element = candidate
           pattern = found
+          report.source = source
           break
         }
         if (element === null) {

@@ -1,12 +1,15 @@
 /**
  * dsh-selection-tools 系统级伴生进程（Node + koffi + GDI+）。
  *
- * 1. **全局划词**：轮询鼠标左右中键与光标位置，识别"拖选/双击选词"，注入一次 Ctrl+C 读剪贴板取词。
+ * 1. **全局划词**：轮询鼠标左右中键与光标位置识别"拖选/双击选词"，手势落下就弹菜单——
+ *    **划词时一次都不碰剪贴板**；选中的文字留到用户点菜单项时才解析（UI Automation 优先，
+ *    读不到才注入一次 Ctrl+C 读剪贴板兜底）。
  * 2. **两个原生浮层窗口**（都在本进程内，GDI+ 自绘，不依赖浏览器、不额外起进程）：
  *    - 划词菜单：出现在选区右下角，**有显示时限**（默认 3.6s）、任意键点到别处即消失；
  *    - 回答窗口（面板）：**只有手动关闭才会消失**，新划词不会动它；没有悬浮球、没有最小化。
- * 3. **上下文**：菜单弹出后用 UI Automation 读"选区所在的段落"（worker 线程 + 超时），
- *    点菜单项时连同选区一起交给 agent——像知乎划词解释那样带语境，读不到就安静降级。
+ * 3. **读选区与上下文**：手势落下就用 UI Automation 一次读完"选中的文字 + 它所在的段落"
+ *    （worker 线程 + 超时，全程不碰剪贴板）；点菜单项时连同上下文一起交给 agent——像知乎
+ *    划词解释那样带语境，读不到就安静降级成"只有选区"、再读不到才退到剪贴板兜底。
  * 4. **跑 agent**：直接调用 DSH 插件的 /run 路由（SSE），把流式文本画到回答窗口上。
  */
 import { spawnSync } from 'node:child_process'
@@ -16,6 +19,7 @@ import { join } from 'node:path'
 
 import { createContextReader } from './context.mjs'
 import { createGestureDetector, createLatestQueue } from './gesture.mjs'
+import { menuDecision, pickSelection } from './policy.mjs'
 import { captureSelection, clampSelection } from './selection.mjs'
 import { createGdi } from './native/gdi.mjs'
 import { captureScreenRect } from './native/capture.mjs'
@@ -34,13 +38,58 @@ const LOCALE = process.env.DSH_SELECTION_LOCALE === 'en' ? 'en' : 'zh'
 const MENU_TIMEOUT_MS = Number(process.env.DSH_SELECTION_MENU_TIMEOUT_MS ?? 3600)
 /** 单次上下文读取的时间预算（毫秒）：超时就丢掉 worker，按"没有上下文"处理。 */
 const CONTEXT_TIMEOUT_MS = Number(process.env.DSH_SELECTION_CONTEXT_TIMEOUT_MS ?? 1800)
-/** 上下文开关（`DSH_SELECTION_CONTEXT=0` 可关掉）。 */
+/**
+ * UI Automation 开关（`DSH_SELECTION_CONTEXT=0` 可关掉）。
+ *
+ * 注意它现在管两件事：读"选区所在的段落"与**读选区本身**。关掉之后菜单不再过滤手势
+ * （一律弹），选区文字只能走剪贴板兜底——等于退回老行为，只在 UIA 明显捣乱时才用。
+ */
 const CONTEXT_ENABLED = process.env.DSH_SELECTION_CONTEXT !== '0'
 /**
  * 取词时是否校验"这次剪贴板写入来自前台窗口"（`DSH_SELECTION_CLIPBOARD_OWNER=0` 可关掉）。
  * 关掉就退回老行为：只要剪贴板序号变了就当作取词成功——遇到取不到词的个别应用才需要关。
  */
 const OWNER_CHECK = process.env.DSH_SELECTION_CLIPBOARD_OWNER !== '0'
+
+/** 环境变量读成非负数（读不出/非法就用默认值）。 */
+function envNumber(raw, fallback) {
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 ? value : fallback
+}
+
+/**
+ * 手势落下后给 UIA 的决策窗口（毫秒）。
+ *
+ * 菜单不再等取词：老实现要先注入 Ctrl+C 读剪贴板，读到了才弹菜单——读不到就等于
+ * **菜单呼不出来**（DSH 桌面端的 WebView2 窗口里注入的 Ctrl+C 拿不到剪贴板，个别
+ * 外部应用也偶发同样的问题）。现在手势一落地就开始 UIA 预读，最多等这么久拿一个
+ * "这一点上有没有选中文字"的结论：读到了按它办，超时/读不到就照弹（点菜单项时还有
+ * 剪贴板兜底）。设成 0 = 手势一到就弹，不做任何过滤。
+ */
+const MENU_DECIDE_MS = envNumber(process.env.DSH_SELECTION_MENU_DECIDE_MS, 280)
+/**
+ * 菜单弹出时 UIA 预读的重试次数。
+ *
+ * Chromium（含 DSH 桌面端自己的 WebView2 窗口）是**被 UIA 问到才打开无障碍树**的：冷
+ * 启动那一下连 TextPattern 都没有（实测：本轮第一次划词 3 次尝试全空，之后再问就正常）。
+ * 预读在决策窗口超时之后仍会继续跑，所以这些重试主要是在替**点菜单项时**把树焐热。
+ */
+const MENU_PROBE_RETRIES = envNumber(process.env.DSH_SELECTION_MENU_PROBE_RETRIES, 3)
+/**
+ * 点菜单项时补读 UIA 的重试次数。
+ * 那时无障碍树通常已经热了，给 1 次机会挡的是"刚巧还在冷启动"；再多就只是拖延
+ * 剪贴板兜底（那才是真的读不到时的出路）。
+ */
+const CLICK_PROBE_RETRIES = envNumber(process.env.DSH_SELECTION_CLICK_PROBE_RETRIES, 1)
+/**
+ * 选区文字从哪来：
+ * - `auto`（默认）：UIA 优先，读不到才注入一次 Ctrl+C 读剪贴板；
+ * - `uia`：只用 UIA，读不到就报错（绝不碰剪贴板）；
+ * - `clipboard`：直接用剪贴板（老行为；某个应用 UIA 读得不准时的逃生舱）。
+ */
+const TEXT_SOURCE = ['auto', 'uia', 'clipboard'].includes(process.env.DSH_SELECTION_TEXT_SOURCE)
+  ? process.env.DSH_SELECTION_TEXT_SOURCE
+  : 'auto'
 const GAP = 8
 const VK_LBUTTON = 0x01
 const VK_RBUTTON = 0x02
@@ -86,8 +135,12 @@ const state = {
   lastGesture: null,
   lastCapture: null,
   lastMenuDismiss: null,
-  lastContext: null,
-  contextPending: null,
+  /** 最近一次 UIA 探针（读到了什么）。 */
+  lastProbe: null,
+  /** 最近一次"弹不弹菜单"的结论与理由（呼不出来时看这里）。 */
+  lastMenuDecision: null,
+  /** 最近一次"点菜单项之后用了哪个来源的文字"。 */
+  lastResolve: null,
   run: null,
   startedAt: Date.now(),
   errors: [],
@@ -433,12 +486,7 @@ const menuWindow = api !== null && gdi !== null
         const scale = menuWindow.scale()
         const row = menuRowAt(x / scale, y / scale)
         void data
-        if (row >= 0) {
-          // 先取"这个菜单绑的那次选区"，再收菜单（hideMenu 会清掉它）
-          const selection = menu.selection
-          hideMenu('item-click')
-          startRun(row === 0 ? 'explain' : 'translate', selection)
-        }
+        if (row >= 0) runMenuAction(row === 0 ? 'explain' : 'translate')
         return true
       },
       onError(error) {
@@ -462,52 +510,107 @@ function menuReady() {
 }
 
 /**
- * 启动上下文读取（菜单弹出之后调用，不阻塞菜单）。
+ * 把一次 UIA 探针结果写进这次选区：**选区文字**写 `selection.text`，
+ * **选区所在的段落**写 `selection.context`。空结果保持原样（安静降级）。
  *
- * 读到的上下文写回 `state.selection.context`：点菜单项时 startRun 直接用；
- * 读不到（应用不支持 UIA 文本、选区串台、超时）就保持空串，安静降级。
+ * @param source - 这一步叫什么（uia-prefetch / uia-fresh）：只用于诊断——回答是不是
+ *   "UIA 读到的"、还是退到了剪贴板，看 `lastResolve.source` 就知道。
  */
-function startContextRead(selection) {
-  state.contextPending = null
-  state.lastContext = { state: 'disabled', at: Date.now() }
-  if (contextReader === null) return
+function applyProbe(selection, result, source) {
+  if (result === null || result === undefined) return
+  if (typeof result.selection === 'string' && result.selection.trim() !== '') {
+    if (typeof selection.text !== 'string' || selection.text.trim() === '') selection.textSource = source
+    selection.text = result.selection
+  }
+  if (typeof result.text === 'string' && result.text !== '') {
+    selection.context = result.text
+    selection.contextUnit = result.unit
+    selection.contextState = 'ready'
+  } else if (selection.contextState === 'reading') {
+    selection.contextState = 'none'
+  }
+}
+
+/**
+ * 手势落下时的 UIA 预读：**不注入按键、不碰剪贴板**。
+ *
+ * 一次调用同时拿到"选中的是哪段文字"与"它所在的段落"——后者是给 agent 的上下文，
+ * 前者是菜单项点下去之后真正要处理的东西。读不到就保持空串（安静降级）。
+ *
+ * @param selection - 这次划词的锚点对象。
+ * @returns 在途的 promise（点菜单项时还要等它）。
+ */
+function startProbe(selection) {
   selection.contextState = 'reading'
-  state.lastContext = { state: 'reading', at: Date.now() }
-  const pending = contextReader.read({ x: selection.x, y: selection.y }, selection.text)
-  state.contextPending = pending
+  if (contextReader === null) {
+    selection.contextState = 'disabled'
+    state.lastProbe = { state: 'disabled', at: Date.now() }
+    return Promise.resolve(null)
+  }
+  const pending = contextReader.probe({ x: selection.x, y: selection.y }, { retries: MENU_PROBE_RETRIES })
+  selection.pending = pending
   void pending
     .then((result) => {
-      if (state.selection !== selection) return
-      if (result === null || typeof result.text !== 'string' || result.text.trim() === '') {
-        selection.contextState = 'none'
-        state.lastContext = { state: 'none', at: Date.now(), stats: contextReader.stats() }
+      applyProbe(selection, result, 'uia-prefetch')
+      if (result === null) {
+        state.lastProbe = { state: 'none', at: Date.now(), stats: contextReader.stats() }
         return
       }
-      selection.context = result.text
-      selection.contextUnit = result.unit
-      selection.contextState = 'ready'
-      state.lastContext = {
+      state.lastProbe = {
         state: 'ready',
+        selectionLength: typeof result.selection === 'string' ? result.selection.length : 0,
+        contextLength: typeof result.text === 'string' ? result.text.length : 0,
         unit: result.unit,
-        length: result.text.length,
         className: result.className,
+        /** 这条 TextPattern 是从"点上的元素"还是"焦点元素"读到的。 */
+        source: result.source,
+        candidates: result.candidates,
         at: Date.now(),
         stats: contextReader.stats(),
       }
     })
     .catch((error) => {
-      if (state.selection === selection) selection.contextState = 'error'
-      reportError('context', error)
+      selection.contextState = 'error'
+      reportError('probe', error)
     })
+  return pending
 }
 
-/** 显示划词菜单（带时限）。 */
-function showMenu(text, x, y) {
+/**
+ * 手势落下后等一个"弹不弹"的结论：最多等 budgetMs，等不到（或没有 UIA）就按"未知"
+ * 处理——照弹，点菜单项时还有剪贴板兜底。
+ * @returns `{ open, reason }`（见 policy.mjs 的 menuDecision）。
+ */
+async function decideMenu(pending, budgetMs) {
+  if (contextReader === null || budgetMs <= 0) return menuDecision(null)
+  let timer = null
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), budgetMs)
+    timer.unref?.()
+  })
+  try {
+    const result = await Promise.race([pending, timeout])
+    if (result === 'timeout') return { open: true, reason: 'timeout' }
+    return menuDecision(result)
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
+}
+
+/**
+ * 显示划词菜单（带时限）。
+ *
+ * 只记「这次划在哪、到时候要处理哪段文字」：回答窗口的内容归它自己，绝不在弹菜单时被
+ * 改写（踩过：这里顺手把 ui.source/answer/status 重置了，于是新划词后只要窗口重绘一次，
+ * 就变成「显示新选中的文字 + 没有文本输出 + 就绪」。现在只有点解释/翻译才换内容）。
+ *
+ * @param selection - 这次划词的锚点对象；它的 text 可能还是空的（UIA 预读正在跑，点菜单
+ *   项时才会等它）。
+ */
+function showMenu(selection) {
   if (!menuReady()) return null
-  // 只记"这次选了什么"：回答窗口的内容归它自己，绝不在弹菜单时被改写
-  // （踩过：这里顺手把 ui.source/answer/status 重置了，于是新划词后只要窗口重绘一次，
-  //  就变成"显示新选中的文字 + 没有文本输出 + 就绪"。现在只有点解释/翻译才换内容。）
-  const selection = { text, x, y, at: Date.now(), context: '', contextUnit: '', contextState: 'idle' }
+  const x = selection.x
+  const y = selection.y
   state.selection = selection
   menu.selection = selection
   menu.dark = systemDark()
@@ -530,8 +633,6 @@ function showMenu(text, x, y) {
     hideMenu('timeout')
   }, MENU_TIMEOUT_MS)
   menu.timer.unref?.()
-  // 菜单已经可见了才开始读上下文：不给"划词 → 菜单"这条链路加延迟。
-  startContextRead(selection)
   return menu.rect
 }
 
@@ -601,40 +702,152 @@ async function stopRun() {
 }
 
 /**
- * 发起一轮解释/翻译，流式画到回答窗口。
+ * 把回答窗口切到某一轮的初始状态并显示。
+ *
+ * 只有点菜单项才会走到这里——新划词一律不动回答窗口里的内容
+ * （踩过：弹菜单时顺手重置 ui.source/answer，于是"新划词后点一下窗口"就变成"显示新选中的
+ * 文字 + 没有文本输出 + 就绪"）。
+ *
  * @param action - 解释 / 翻译。
- * @param selection - 这一次要处理哪段选区（菜单上绑的那一次）；缺席时退回"最近一次划词"。
+ * @param selection - 这次要处理哪段选区（菜单上绑的那一次）。
+ * @param status - `reading`（正在读选区）/ `running` / `error`。
+ * @param error - status 为 error 时的错误文案。
  */
-function startRun(action, selection = state.selection) {
+function openPanel(action, selection, status, error = '') {
   state.run?.abort?.()
+  state.run = null
   ui.action = action
-  // 只有点菜单项才换内容：这里把"这次要处理什么"写进回答窗口
-  // （别处一律不动 ui.source —— 新划词只更新 state.selection，不会改窗口）
-  ui.source = selection === null ? '' : selection.text
+  ui.source = selection === null || typeof selection.text !== 'string' ? '' : selection.text
   ui.answer = ''
-  ui.error = ''
+  ui.error = error
   ui.copyFeedback = ''
-  ui.status = 'running'
+  ui.context = selection === null || typeof selection.context !== 'string' ? '' : selection.context
+  ui.status = status
   stopSpeaking()
   ui.scroll = 0
   // 第一次打开时落在屏幕右下角；之后沿用用户拖到的位置
   if (panel.mode === 'hidden') panel.position = null
   applyMainMode('panel')
   refreshMain()
+}
+
+/**
+ * 解析"这次要处理的是哪段文字"。
+ *
+ * 优先级（`DSH_SELECTION_TEXT_SOURCE` 可整体改成只用某一种）：
+ * 1. `selection.text` 已经有的（例如 `/simulate` 预置的文本）；
+ * 2. 菜单弹出时就开始的 UIA 预读结果；
+ * 3. 现补读一次 UIA（无障碍树这会儿已经热了，通常几毫秒就回来）；
+ * 4. **剪贴板兜底**——注入一次 Ctrl+C 再读剪贴板。
+ *
+ * 第 4 条是全插件唯一会碰用户剪贴板的地方，而且只在用户**点了菜单按钮之后**、前三条
+ * 都拿不到文字时才会走到：划词本身一次都不碰剪贴板。
+ *
+ * @param selection - 这次划词的锚点对象。
+ * @returns `{ text, source }`（source 只用于诊断）：一个来源都拿不到时返回 null。
+ */
+async function resolveSelection(selection) {
+  if (typeof selection.text === 'string' && selection.text.trim() !== '') {
+    // 已经有了（/simulate 预置，或预读早于点击完成并写好了）：直接用。
+    return { text: selection.text, source: selection.textSource === '' ? 'preset' : selection.textSource }
+  }
+  const attempts = []
+  if (TEXT_SOURCE !== 'clipboard') {
+    const prefetched = selection.pending === null || selection.pending === undefined ? null : await selection.pending
+    applyProbe(selection, prefetched, 'uia-prefetch')
+    attempts.push({ source: 'uia-prefetch', text: prefetched === null ? '' : prefetched.selection })
+    if (prefetched === null && contextReader !== null) {
+      const fresh = await contextReader.probe({ x: selection.x, y: selection.y }, { retries: CLICK_PROBE_RETRIES })
+      applyProbe(selection, fresh, 'uia-fresh')
+      attempts.push({ source: 'uia-fresh', text: fresh === null ? '' : fresh.selection })
+    }
+  }
+  const picked = pickSelection(attempts)
+  if (picked !== null) return picked
+  if (TEXT_SOURCE === 'uia') return null
+  // 兜底：注入一次 Ctrl+C 读剪贴板（只在点了菜单按钮之后走这里）。
+  const captured = await captureSelection(api, {
+    checkOwner: OWNER_CHECK,
+    onReport: (report) => {
+      state.lastCapture = report
+    },
+  })
+  const fallback = pickSelection([{ source: 'clipboard', text: captured === null ? '' : clampSelection(captured, MAX_TEXT) }])
+  return fallback
+}
+
+/**
+ * 点菜单项之后：解析选区 → 跑一轮。
+ *
+ * @param action - 解释 / 翻译。
+ * @param selection - 菜单上绑的那次选区。
+ * @param isCurrent - 这次点击还是最新的吗（用户有没有紧接着又点了一次）。
+ */
+async function beginFromMenu(action, selection, isCurrent) {
+  if (selection === null || selection === undefined) return
+  state.selection = selection
+  // 先给反馈：解析最长要走一次剪贴板兜底，不能让用户"点了没反应"。
+  openPanel(action, selection, 'reading')
+  let resolved = null
+  try {
+    resolved = await resolveSelection(selection)
+  } catch (error) {
+    reportError('resolve', error)
+    resolved = null
+  }
+  state.lastResolve = {
+    ok: resolved !== null,
+    source: resolved === null ? '' : resolved.source,
+    length: resolved === null ? 0 : resolved.text.length,
+    at: Date.now(),
+  }
+  if (!isCurrent()) return
+  if (resolved === null) {
+    openPanel(action, selection, 'error', '未能读取选中的文字，请重新划词后再试')
+    return
+  }
+  selection.text = resolved.text
+  startRun(action, selection)
+}
+
+/** 点菜单项之后的串行队列（latest-wins）：解析选区 + 开跑。 */
+let menuRunQueue = null
+
+/**
+ * 点菜单项（原生窗口的点击与 `/click` 验收端点共用）。
+ *
+ * 必须先取出"这个菜单绑的那次选区"再收菜单——`hideMenu` 会把 `menu.selection` 清掉。
+ */
+function runMenuAction(action) {
+  const selection = menu.selection
+  hideMenu('item-click')
+  if (selection === null) return
+  if (menuRunQueue === null) {
+    menuRunQueue = createLatestQueue({
+      run: (job, seq) => beginFromMenu(job.action, job.selection, () => menuRunQueue.isLatest(seq)),
+      onError: (error) => reportError('menu-run', error),
+    })
+  }
+  menuRunQueue.submit({ action, selection })
+}
+
+/**
+ * 发起一轮解释/翻译，流式画到回答窗口。
+ * @param action - 解释 / 翻译。
+ * @param selection - 这一次要处理哪段选区（含已解析好的 text 与 context）。
+ */
+function startRun(action, selection = state.selection) {
+  if (selection === null || typeof selection.text !== 'string' || selection.text.trim() === '') return
+  // 只有点菜单项才换内容：这里把"这次要处理什么"写进回答窗口
+  // （别处一律不动 ui.source —— 新划词只更新 state.selection，不会改窗口）
+  openPanel(action, selection, 'running')
 
   const controller = new AbortController()
   state.run = { abort: () => controller.abort(), sessionId: undefined }
-  const text = selection === null ? '' : selection.text
+  const text = selection.text
+  const context = typeof selection.context === 'string' ? selection.context : ''
   void (async () => {
     try {
-      // 点菜单项时上下文通常已经读好了；还在读就再等一下（读不读得到都不影响出结果）
-      let context = selection === null ? '' : selection.context
-      if (context === '' && state.contextPending !== null) {
-        const result = await state.contextPending
-        if (result !== null && state.selection === selection) context = result.text
-      }
-      ui.context = context
-      refreshMain()
       const response = await fetch(DSH_ORIGIN + '/api/dsh-selection-tools/run', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -716,38 +929,52 @@ function inRect(point, rect) {
 }
 
 /**
- * 处理一次手势：取词 → 弹菜单。
+ * 处理一次手势：**立刻**决定要不要弹菜单——不取词、不碰剪贴板。
+ *
+ * 老实现是"先注入 Ctrl+C 读剪贴板，读到了才弹菜单"，于是取词失败就等于菜单呼不出来
+ * （DSH 桌面端的 WebView2 窗口里注入的 Ctrl+C 拿不到剪贴板；个别外部应用也偶发同样的问题）。
+ * 现在手势一落地就开始 UIA 预读，最多等 MENU_DECIDE_MS 拿一个"这一点上有没有选中文字"的
+ * 结论——菜单弹出的条件里再也没有"能不能取到词"这一项。真正的选中文案留到用户**点菜单项**
+ * 时才解析（UIA 优先，读不到才注入一次 Ctrl+C 读剪贴板）。
  *
  * @param gesture - 手势（含落点）。
- * @param isCurrent - 这次手势是不是最新的（取词期间用户有没有又划一次）。
+ * @param isCurrent - 这次手势是不是最新的（等待期间用户有没有又划一次）。
  */
 async function handleGesture(gesture, isCurrent) {
   state.lastGesture = { ...gesture, at: Date.now() }
   if (inRect(gesture, menu.rect) || inRect(gesture, panel.rect)) return
-  const text = await captureSelection(api, {
-    checkOwner: OWNER_CHECK,
-    onReport: (report) => {
-      state.lastCapture = report
-    },
-  })
-  if (text === null || text.trim() === '') return
-  const clamped = clampSelection(text, MAX_TEXT)
-  if (clamped === '') return
+  const selection = {
+    text: '',
+    /** 这段文字是从哪一步读到的（uia-prefetch / uia-fresh / clipboard / preset）。 */
+    textSource: '',
+    x: gesture.x,
+    y: gesture.y,
+    at: Date.now(),
+    kind: gesture.kind,
+    context: '',
+    contextUnit: '',
+    contextState: 'idle',
+    /** 在途的 UIA 预读（点菜单项时还要等它）。 */
+    pending: null,
+  }
+  const pending = startProbe(selection)
+  const decision = await decideMenu(pending, MENU_DECIDE_MS)
+  state.lastMenuDecision = { open: decision.open, reason: decision.reason, kind: gesture.kind, at: Date.now() }
   if (!isCurrent()) {
-    // 取词期间用户又划了一次：这次的结果过期了，绝不能拿它弹菜单——
-    // 否则菜单/回答窗口里的文字跟用户选的那段对不上（老实现就是这么串台的）。
-    if (state.lastCapture !== null) state.lastCapture.superseded = true
+    // 等待期间用户又划了一次：这次的结果过期了，绝不能拿它弹菜单。
+    state.lastMenuDecision.superseded = true
     return
   }
-  // 只弹菜单：回答窗口与悬浮球不受影响
-  showMenu(clamped, gesture.x, gesture.y)
+  if (!decision.open) return
+  // 只弹菜单：回答窗口不受影响（只有点解释/翻译才换里面的内容）
+  showMenu(selection)
 }
 
 /** 鼠标轮询：手势检测 + 任意键点到别处收起菜单 + Esc 收起菜单。 */
 function startHook() {
-  // 取词要注入 Ctrl+C 并读同一个全局剪贴板：两次取词必须串行，且只有最新那次手势作数。
-  // 重叠取词（后一次注入被前一次轮询读到、前一次的还原落在后一次的窗口里）正是
-  // "回答窗口的内容跟选中文字不符"的根因，见 gesture.mjs 的 createLatestQueue。
+  // 手势要串行、且只有最新那次作数：一次手势要等 UIA 的"有没有选中文字"结论（最多
+  // MENU_DECIDE_MS），这期间用户完全可能又划一次——拿过期的那次去弹菜单，菜单绑的就不是
+  // 用户看着选的那段文字。见 gesture.mjs 的 createLatestQueue。
   gestureQueue = createLatestQueue({
     run: (gesture, seq) => handleGesture(gesture, () => gestureQueue.isLatest(seq)),
     onError: (error) => reportError('gesture', error),
@@ -805,6 +1032,10 @@ const server = createServer((req, res) => {
       ok: true,
       hookEnabled: HOOK_ENABLED,
       menuTimeoutMs: MENU_TIMEOUT_MS,
+      /** 手势落下后给 UIA 的决策窗口（毫秒）。 */
+      menuDecideMs: MENU_DECIDE_MS,
+      /** 选区文字的来源策略：auto / uia / clipboard。 */
+      textSource: TEXT_SOURCE,
       menu: { visible: menu.visible, rect: menu.rect, scale: menu.scale, hover: menu.hover },
       panel: { mode: panel.mode, rect: panel.rect, position: panel.position, scale: panel.scale },
       ui: {
@@ -818,15 +1049,24 @@ const server = createServer((req, res) => {
         viewHeight: Math.round(ui.viewHeight),
       },
       lastGesture: state.lastGesture,
+      /** 最近一次 UIA 探针读到了什么（菜单呼不出来时先看这里）。 */
+      lastProbe: state.lastProbe,
+      /** 最近一次"弹不弹菜单"的结论与理由。 */
+      lastMenuDecision: state.lastMenuDecision,
+      /** 最近一次点菜单项之后，用的是哪个来源的文字。 */
+      lastResolve: state.lastResolve,
+      /** 最近一次剪贴板兜底取词（只在点菜单项后 UIA 读不到时才有）。 */
       lastCapture: state.lastCapture,
       gestures: gestureQueue === null ? null : gestureQueue.stats(),
       lastMenuDismiss: state.lastMenuDismiss ?? null,
       context: {
         enabled: contextReader !== null,
-        unit: state.selection === null ? '' : (state.selection.contextUnit ?? ''),
+        /** 这次划词的选区/段落是怎么读到的：reading / ready / none / disabled / error。 */
         state: state.selection === null ? 'idle' : (state.selection.contextState ?? 'idle'),
+        unit: state.selection === null ? '' : (state.selection.contextUnit ?? ''),
+        /** 这次划词的选中文案长度（UIA 读到、或点菜单项后解析出来的）。 */
+        selectionLength: state.selection === null ? 0 : String(state.selection.text ?? '').length,
         length: ui.context.length,
-        last: state.lastContext,
         stats: contextReader === null ? null : contextReader.stats(),
       },
       errors: state.errors.slice(-5),
@@ -842,14 +1082,52 @@ const server = createServer((req, res) => {
         const work = primaryWorkArea(api)
         const x = typeof body.x === 'number' ? body.x : work.right - 400
         const y = typeof body.y === 'number' ? body.y : 300
-        const rect = showMenu(text, x, y)
-        if (typeof body.context === 'string' && body.context !== '' && state.selection !== null) {
-          state.selection.context = body.context
-          state.selection.contextState = 'ready'
+        // 造一个"已经读到选区"的划词锚点（跳过手势与 UIA 探针），供验收脚本走完整链路：
+        // 弹菜单 → /click 点菜单项 → 直接拿这里的 text 跑一轮。
+        const selection = {
+          text,
+          textSource: 'preset',
+          x,
+          y,
+          at: Date.now(),
+          kind: 'simulate',
+          context: typeof body.context === 'string' ? body.context : '',
+          contextUnit: '',
+          contextState: typeof body.context === 'string' && body.context !== '' ? 'ready' : 'idle',
+          pending: null,
         }
+        const rect = showMenu(selection)
         respondJson(res, 200, { ok: true, menu: rect })
       } catch (error) {
         reportError('simulate', error)
+        respondJson(res, 500, { ok: false, message: String(error?.message ?? error) })
+      }
+    })()
+    return
+  }
+  // 验收/排障：在某个屏幕坐标上直接跑一次 UIA 探针，看看"菜单为什么不弹"。
+  if (req.method === 'POST' && url.pathname === '/probe') {
+    void (async () => {
+      try {
+        const body = await readJson(req)
+        if (contextReader === null) {
+          respondJson(res, 200, { ok: false, message: 'context reader disabled' })
+          return
+        }
+        const point = { x: Number(body.x ?? 0), y: Number(body.y ?? 0) }
+        const retries = Number.isFinite(body.retries) ? Number(body.retries) : undefined
+        const result = await contextReader.probe(point, retries === undefined ? {} : { retries })
+        respondJson(res, 200, {
+          ok: true,
+          decision: menuDecision(result),
+          selection: result === null ? '' : result.selection,
+          context: result === null ? '' : result.text,
+          source: result === null ? '' : result.source,
+          className: result === null ? '' : result.className,
+          stats: contextReader.stats(),
+        })
+      } catch (error) {
+        reportError('probe', error)
         respondJson(res, 500, { ok: false, message: String(error?.message ?? error) })
       }
     })()
@@ -887,13 +1165,8 @@ const server = createServer((req, res) => {
         const cssX = Number(body.x ?? 0)
         const cssY = Number(body.y ?? 0)
         if (target === 'menu') {
-          const scale = menuWindow.scale()
           const row = menuRowAt(cssX, cssY)
-          if (row >= 0) {
-            const selection = menu.selection
-            hideMenu('item-click')
-            startRun(row === 0 ? 'explain' : 'translate', selection)
-          }
+          if (row >= 0) runMenuAction(row === 0 ? 'explain' : 'translate')
           respondJson(res, 200, { ok: true, target, row })
           return
         }
