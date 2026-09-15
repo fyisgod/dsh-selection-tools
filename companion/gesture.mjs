@@ -5,6 +5,10 @@
  * - \`drag\`：按下后移动超过阈值再松开（拖选）；
  * - \`double\`：两次间隔很短、位置几乎相同的点击（双击选词）。
  *
+ * 两种手势都带上 \`x\`/\`y\`（松开的位置，菜单锚在这里）与 \`downX\`/\`downY\`（按下的位置）：
+ * 后者用来回答"这一次拖拽/双击到底选没选出文字"——旧选区还留在应用里的时候，光凭松开
+ * 的位置分不出"这次真选了"和"上次留下的"（见 companion/policy.mjs 的 menuDecision）。
+ *
  * 采样由调用方（companion/main.mjs）以固定频率喂进来，因此这里完全不依赖
  * 钩子/回调，测试可以直接喂一串假采样。
  */
@@ -60,7 +64,9 @@ export function createGestureDetector(options = {}) {
     if (!pressed) return
     pressed = false
     const distance = Math.max(moved, Math.hypot(x - downX, y - downY))
-    const at = { x, y, time }
+    // downX/downY 也要带上：调用方用"按下点"判断**这次手势是不是选出了那段文字**
+    // （旧选区还留在应用里时，光凭鼠标松开的位置分不出"这次真选了"还是"上次留下的"）。
+    const at = { x, y, time, downX, downY }
     if (distance >= config.dragMinDistance) {
       awaitingSecondClick = false
       onGesture({ kind: 'drag', distance, ...at })

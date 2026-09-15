@@ -135,6 +135,10 @@ const state = {
   lastGesture: null,
   lastCapture: null,
   lastMenuDismiss: null,
+  /** 最近一次菜单收起时，菜单绑的是哪段文字（用来识别"手势没碰到、文字也没变"的旧选区）。 */
+  lastMenuSelection: '',
+  /** 最近几次"弹不弹"的结论（偶发"划不出来"时看这个：/status 的 recentDecisions）。 */
+  recentDecisions: [],
   /** 最近一次 UIA 探针（读到了什么）。 */
   lastProbe: null,
   /** 最近一次"弹不弹菜单"的结论与理由（呼不出来时看这里）。 */
@@ -547,7 +551,10 @@ function startProbe(selection) {
     state.lastProbe = { state: 'disabled', at: Date.now() }
     return Promise.resolve(null)
   }
-  const pending = contextReader.probe({ x: selection.x, y: selection.y }, { retries: MENU_PROBE_RETRIES })
+  const pending = contextReader.probe(
+    { x: selection.x, y: selection.y },
+    { retries: MENU_PROBE_RETRIES, press: selection.press },
+  )
   selection.pending = pending
   void pending
     .then((result) => {
@@ -564,6 +571,8 @@ function startProbe(selection) {
         className: result.className,
         /** 这条 TextPattern 是从"点上的元素"还是"焦点元素"读到的。 */
         source: result.source,
+        /** 这次手势（按下点/松开点）碰到这段选区了吗（false = 落在别处，多半是上次留下的）。 */
+        atGesture: result.atGesture ?? null,
         candidates: result.candidates,
         at: Date.now(),
         stats: contextReader.stats(),
@@ -576,25 +585,43 @@ function startProbe(selection) {
   return pending
 }
 
-/**
- * 手势落下后等一个"弹不弹"的结论：最多等 budgetMs，等不到（或没有 UIA）就按"未知"
- * 处理——照弹，点菜单项时还有剪贴板兜底。
- * @returns `{ open, reason }`（见 policy.mjs 的 menuDecision）。
- */
-async function decideMenu(pending, budgetMs) {
-  if (contextReader === null || budgetMs <= 0) return menuDecision(null)
+/** 等一个 promise 最多 ms 毫秒；超时返回字符串 'timeout'（定时器不留痕）。 */
+async function waitFor(promise, ms) {
   let timer = null
   const timeout = new Promise((resolve) => {
-    timer = setTimeout(() => resolve('timeout'), budgetMs)
+    timer = setTimeout(() => resolve('timeout'), ms)
     timer.unref?.()
   })
   try {
-    const result = await Promise.race([pending, timeout])
-    if (result === 'timeout') return { open: true, reason: 'timeout' }
-    return menuDecision(result)
+    return await Promise.race([promise, timeout])
   } finally {
     if (timer !== null) clearTimeout(timer)
   }
+}
+
+/**
+ * 手势落下后等一个"弹不弹"的结论。
+ *
+ * **两级预算**：先在 budgetMs 内等探针（正常的探针 10–30ms 就回来了，这一级几乎用不满）；
+ * 超时说明它只是**慢**（跨进程 provider、无障碍树刚被焐热、系统一时繁忙），不是没有答案
+ * ——探针本身还在跑，所以再宽限一段（budgetMs 的三倍，上限 1s）等它的结论。只有宽限期
+ * 也用完才按"未知"处理：照弹，点菜单项时还有剪贴板兜底。
+ *
+ * 为什么要有宽限期：跳过去直接照弹的话，用户"在别处随便一拖"刚好撞上一次慢探针，
+ * 菜单又会冒出来——那正是"选中一次之后菜单甩不掉"的另一条来路。宽限期的代价只是
+ * 结论晚几十毫秒（探针一回来就出菜单），而不是"菜单变慢"。
+ *
+ * @param previous - 上一次菜单收起时绑的那段文字（见 policy.mjs 的 menuDecision）。
+ * @returns `{ open, reason }`（见 policy.mjs 的 menuDecision）。
+ */
+async function decideMenu(pending, budgetMs, previous) {
+  if (contextReader === null || budgetMs <= 0) return menuDecision(null, previous)
+  const first = await waitFor(pending, budgetMs)
+  if (first !== 'timeout') return menuDecision(first, previous)
+  const grace = Math.min(1000, budgetMs * 3)
+  const second = await waitFor(pending, grace)
+  if (second === 'timeout') return { open: true, reason: 'timeout' }
+  return menuDecision(second, previous)
 }
 
 /**
@@ -644,6 +671,8 @@ function hideMenu(reason) {
   }
   if (menu.visible) {
     state.lastMenuDismiss = { reason, at: Date.now() }
+    // 这个菜单绑的是哪段文字：菜单收起后，"手势没碰到 + 文字没变"的那次探针就是它。
+    state.lastMenuSelection = typeof menu.selection?.text === 'string' ? menu.selection.text : ''
     menu.visible = false
     if (menuReady()) menuWindow.hide()
   }
@@ -949,6 +978,14 @@ async function handleGesture(gesture, isCurrent) {
     textSource: '',
     x: gesture.x,
     y: gesture.y,
+    /**
+     * 手势**按下**的地方。判断"读到的选区是不是这次手势选出来的"要用它：
+     * 菜单收起之后旧选区还留在应用里，光凭落点分不出"这次真选了"和"上次留下的"。
+     */
+    press: {
+      x: Number.isFinite(gesture.downX) ? gesture.downX : gesture.x,
+      y: Number.isFinite(gesture.downY) ? gesture.downY : gesture.y,
+    },
     at: Date.now(),
     kind: gesture.kind,
     context: '',
@@ -958,8 +995,22 @@ async function handleGesture(gesture, isCurrent) {
     pending: null,
   }
   const pending = startProbe(selection)
-  const decision = await decideMenu(pending, MENU_DECIDE_MS)
+  const decision = await decideMenu(pending, MENU_DECIDE_MS, state.lastMenuSelection)
   state.lastMenuDecision = { open: decision.open, reason: decision.reason, kind: gesture.kind, at: Date.now() }
+  state.recentDecisions.push({
+    at: state.lastMenuDecision.at,
+    kind: gesture.kind,
+    distance: Math.round(gesture.distance ?? 0),
+    open: decision.open,
+    reason: decision.reason,
+    /** 探针当时读到了什么（null = 这次是"宽限期也用完"的兜底）。 */
+    probe: state.lastProbe === null
+      ? null
+      : { at: state.lastProbe.at, state: state.lastProbe.state, source: state.lastProbe.source, atGesture: state.lastProbe.atGesture ?? null, selectionLength: state.lastProbe.selectionLength ?? 0, className: state.lastProbe.className ?? '' },
+    point: { x: gesture.x, y: gesture.y },
+    press: { x: gesture.downX, y: gesture.downY },
+  })
+  if (state.recentDecisions.length > 20) state.recentDecisions.shift()
   if (!isCurrent()) {
     // 等待期间用户又划了一次：这次的结果过期了，绝不能拿它弹菜单。
     state.lastMenuDecision.superseded = true
@@ -1055,6 +1106,10 @@ const server = createServer((req, res) => {
       lastMenuDecision: state.lastMenuDecision,
       /** 最近一次点菜单项之后，用的是哪个来源的文字。 */
       lastResolve: state.lastResolve,
+      /** 最近 20 次"弹不弹"的结论（偶发"划不出来"时按时间顺查看每次的理由）。 */
+      recentDecisions: state.recentDecisions,
+      /** 上一次菜单收起时绑的那段文字（判断"旧选区"要用它比对）。 */
+      lastMenuSelection: { length: state.lastMenuSelection.length, text: state.lastMenuSelection.slice(0, 120) },
       /** 最近一次剪贴板兜底取词（只在点菜单项后 UIA 读不到时才有）。 */
       lastCapture: state.lastCapture,
       gestures: gestureQueue === null ? null : gestureQueue.stats(),
@@ -1116,13 +1171,21 @@ const server = createServer((req, res) => {
         }
         const point = { x: Number(body.x ?? 0), y: Number(body.y ?? 0) }
         const retries = Number.isFinite(body.retries) ? Number(body.retries) : undefined
-        const result = await contextReader.probe(point, retries === undefined ? {} : { retries })
+        // press 可以显式给：验收时用"元素看点 A、手势按在 B"复现"旧选区"那一路
+        // （不给就按 point 算，跟真实手势里探针点即落点的老行为一致）。
+        const press = typeof body.press === 'object' && body.press !== null
+          ? { x: Number(body.press.x ?? point.x), y: Number(body.press.y ?? point.y) }
+          : point
+        const result = await contextReader.probe(point, { retries, press })
         respondJson(res, 200, {
           ok: true,
           decision: menuDecision(result),
           selection: result === null ? '' : result.selection,
           context: result === null ? '' : result.text,
           source: result === null ? '' : result.source,
+          atGesture: result === null ? null : (result.atGesture ?? null),
+          /** 选区矩形（诊断用：看"为什么没弹"时对照着手势落点）。 */
+          rects: result === null ? null : (result.rects ?? null),
           className: result === null ? '' : result.className,
           stats: contextReader.stats(),
         })

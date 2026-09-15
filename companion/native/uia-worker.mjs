@@ -39,8 +39,11 @@ parentPort?.on('message', async (message) => {
       parentPort.postMessage({ id, result: api.diagnose(message.point) })
       return
     }
+    // press 是手势按下的地方：用来判断读到的选区是不是这次手势选出来的（见 uia.mjs 的 probe）。
     const call = () =>
-      message?.type === 'probe' ? api.probe(message.point) : api.read(message.point, message.expected)
+      message?.type === 'probe'
+        ? api.probe(message.point, message.press === undefined ? {} : { press: message.press })
+        : api.read(message.point, message.expected)
     // 重试次数由主进程按场景给（默认 2 次）：
     // - 菜单弹出时的预读：Chromium 这类应用是"被 UIA 问到才打开无障碍树"，冷启动那一刻
     //   TextPattern 还不存在（实测：第 0 次 no text pattern，第 1 次开始都正常），所以要重试；

@@ -6,6 +6,11 @@
  * 这里不碰任何系统 API。
  */
 
+/** 折叠空白后的文字，用来比对"是不是同一段"。 */
+function fold(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim()
+}
+
 /**
  * 菜单该不该弹。
  *
@@ -14,24 +19,45 @@
  * 剪贴板，就得自己回答老实现靠剪贴板回答的问题：**这一次拖拽/双击到底是不是在选文字**。
  * 用 UIA 的文本模式回答：
  *
- * - 读到选区里有文字 → 弹；
- * - 这一点上的元素带 TextPattern 却没有任何选区 → 确实没在选文字（拖窗口、拖滑块、
- *   双击图标…），**不弹**，否则「选中文字才弹菜单」就退化成「随便一拖都弹」；
- * - 什么都没读到（应用不暴露 UIA 文本、读超时）→ **不知道**，照弹：点菜单项时还有
- *   剪贴板兜底，跟老行为一致，不能因为读不到就吞掉用户这次划词。
+ * - 没有选区（元素带 TextPattern 却报不出任何选区——点上的元素是这样，焦点元素也是
+ *   这样）、或者手势落在桌面/任务栏这类不含可选文本的系统外壳上 → **不弹**：拖窗口、
+ *   拖滑块、拖桌面、双击图标都不该弹；
+ * - 读到选区、**这次手势碰到了它**（按下点或松开点落在选区矩形里，容差按行高算）→ 弹：
+ *   这次手势选的就是它；
+ * - 读到选区、手势没碰到，**但这段文字跟上一次菜单绑的那段不是同一段** → 弹：用户确实
+ *   重新选了一段。几何判定会被 DPI、字符边界吸附、行距这些噪声带偏，所以文字不同就认；
+ * - 读到选区、手势没碰到、文字也和上次菜单那段一模一样 → **不弹**：那是上一次划词留在
+ *   应用里的旧选区，菜单已经为它弹过、也已经收起。少了这条，用户在菜单收起后随便一拖，
+ *   探针照样读到那段旧文字，菜单就"再也甩不掉"。
+ *
+ * 只有"什么都没读到"（应用不暴露 UIA 文本、读超时）才算**不知道**，照弹：点菜单项时还有
+ * 剪贴板兜底，跟老行为一致，不能因为读不到就吞掉用户这次划词。
  *
  * @param probe - UIA 探针结果（见 companion/native/uia.mjs 的 probe()）：
- *   `null` = 读不到；`{ selection, source }`，source 是 'point'（点上的元素）或 'focused'。
- * @returns `{ open, reason }`；reason 只用于诊断（/status 里能看到为什么没弹）。
+ *   `null` = 读不到；`{ selection, source, atGesture }`，source 是 'point'（点上的元素）、
+ *   'focused' 或 'shell'；atGesture 是"这次手势碰没碰到这段选区"（null = 拿不到矩形）。
+ * @param previous - **上一次菜单收起时绑的那段文字**（没有就传空串）：用来识别"手势没碰到、
+ *   文字也没变"的旧选区。
+ * @returns `{ open, reason }`；reason 只用于诊断（/status 里能看到为什么没弹）：
+ *   selection（这次手势选出来的）/ stale-selection（上次留下的旧选区）/
+ *   no-selection（确实没在选文字）/ shell（落在桌面/任务栏这类系统外壳上）/
+ *   unknown（读不到，照弹）。
  */
-export function menuDecision(probe) {
+export function menuDecision(probe, previous) {
   if (probe === null || probe === undefined) return { open: true, reason: 'unknown' }
-  const selected = typeof probe.selection === 'string' ? probe.selection.trim() : ''
-  if (selected !== '') return { open: true, reason: 'selection' }
-  if (probe.source === 'point') return { open: false, reason: 'no-selection' }
-  // 只有焦点元素读得到、而它也没有选区：证据太弱（也可能只是点在了外壳上），
-  // 宁可弹出来让用户自己判断，也不要吞掉他真正想要的那次划词。
-  return { open: true, reason: 'weak' }
+  const selected = fold(probe.selection)
+  if (selected === '') {
+    // 手势落在桌面/任务栏这类系统外壳上：外壳不含可选文本，也是"确实没在选文字"。
+    if (probe.source === 'shell') return { open: false, reason: 'shell' }
+    return { open: false, reason: 'no-selection' }
+  }
+  // 1) 手势碰到了这段选区（按下点或松开点就在它附近）：这次手势选的就是它。
+  if (probe.atGesture === true) return { open: true, reason: 'selection' }
+  // 2) 没碰到，但文字跟上次菜单那段不一样：用户确实重新选了一段（几何判定不可轻信，见上）。
+  const last = fold(previous)
+  if (last === '' || selected !== last) return { open: true, reason: 'selection' }
+  // 3) 同一段文字、手势也没碰到它：上一次划词留下的旧选区，菜单已经为它弹过一次了。
+  return { open: false, reason: 'stale-selection' }
 }
 
 /**

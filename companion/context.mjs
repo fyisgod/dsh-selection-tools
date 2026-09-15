@@ -112,12 +112,14 @@ export function createContextReader(options = {}) {
      * 这是划词的主取词路径：菜单弹出时先探一次（读到选区就顺带拿到上下文），
      * 点菜单项时如果还没读到，再补探一次（那时无障碍树已经热了）。
      * @param point - 手势落点（屏幕物理坐标）。
+     * @param options.press - 手势**按下**的屏幕坐标：用来判断读到的选区是不是这次手势选出来的
+     *   （缺省时按 point 算）。
      * @param options.retries - 读不到时在 worker 里重试几次（默认 2；补读时给 0）。
      * @returns `{ selection, unit, text, ... }` / `null`，语义见 uia.mjs 的 probe()。
      */
     probe(point, options = {}) {
       stats.probes++
-      return request('probe', { point, retries: options.retries }).then((result) => {
+      return request('probe', { point, retries: options.retries, press: options.press }).then((result) => {
         if (result !== null) stats.ok++
         return result
       })

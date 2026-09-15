@@ -24,8 +24,61 @@ const UIA_ClassNamePropertyId = 30012
 const TextUnit_Line = 3
 const TextUnit_Paragraph = 4
 
+/**
+ * "手势碰到选区了吗"允许的**最小**像素余量。
+ *
+ * 实际余量取 `max(本值, 那一行的行高)`：吸附误差与字符同宽（见 gestureTouchesSelection），
+ * 行高才是合适的量级；这里的 8px 只是矩形高度拿不到时的兜底。
+ */
+const PRESS_SLOP = 8
+
+/**
+ * 点落在这些矩形里吗（含余量）。**纯函数**：几何判定最容易写错，单独拎出来用单测钉住。
+ *
+ * 余量取 `max(slopFloor, 矩形高度)`：矩形高度 = 那一行的行高，吸附误差与字符同宽（150% 下
+ * 一个字 15–30px），所以不能写死小像素。矩形是 `{ left, top, right, bottom }`——**没有
+ * height 字段**（踩过：`rect.height` 是 undefined，Math.max 得到 NaN，比较全 false，于是
+ * "手势碰到选区了吗"永远是 false，正常划词全被当成旧选区吃掉、菜单怎么划都不出来）。
+ *
+ * @param point - `{ x, y }`（屏幕物理坐标）。
+ * @param rects - `{ left, top, right, bottom }[]`。
+ * @param slopFloor - 余量下限（拿不到行高时的兜底）。
+ */
+export function pointNearRects(point, rects, slopFloor = PRESS_SLOP) {
+  if (point === null || point === undefined || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return false
+  if (!Array.isArray(rects)) return false
+  for (const rect of rects) {
+    if (rect === null || rect === undefined) continue
+    const slack = Math.max(slopFloor, Number(rect.bottom) - Number(rect.top))
+    if (!Number.isFinite(slack)) continue
+    if (point.x >= rect.left - slack && point.x <= rect.right + slack && point.y >= rect.top - slack && point.y <= rect.bottom + slack) return true
+  }
+  return false
+}
+
 /** 段落文本的上限：再长对模型也没用，反而挤压选区本身。 */
 const MAX_CONTEXT_CHARS = 1500
+
+/**
+ * 系统外壳的窗口类（桌面与任务栏）。
+ *
+ * 它们**一定没有可选文本**：手势落在上面就等于"这一点上没在选文字"，属于强证据——不能让
+ * 它掉进"什么都没读到 → 未知 → 照弹"那一档。用户最容易"随手一拖"的地方就是桌面/任务栏，
+ * 掉进未知档的话菜单会在那儿莫名其妙地冒出来（实测：桌面空白处与副屏任务栏都这样）。
+ *
+ * SysListView32 也是资源管理器文件列表的类：那边只要有 TextPattern，就轮不到这条判据
+ * （只有"整条候选链都没读到文本"时才看它）。
+ */
+const SHELL_CLASSES = new Set([
+  '#32769', // 桌面窗口本身的类名
+  'Progman',
+  'WorkerW',
+  'SHELLDLL_DefView',
+  'SysListView32', // 桌面图标层 / 文件列表
+  'Shell_TrayWnd',
+  'Shell_SecondaryTrayWnd',
+  'TrayNotifyWnd',
+])
 
 const CLSID_CUIAutomation = [0xff48dba4, 0x60ef, 0x4201, [0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e]]
 const IID_IUIAutomation = [0x30cbe57d, 0xd9d0, 0x452a, [0xab, 0x13, 0x7a, 0xc5, 0xac, 0x48, 0x25, 0xee]]
@@ -52,6 +105,10 @@ const SLOT = {
   // IUIAutomationTextRange
   clone: 3,
   expandToEnclosingUnit: 6,
+  // 槽位顺序 = IDL 里的声明顺序（Clone 3 / Compare 4 / CompareEndpoints 5 / ExpandToEnclosingUnit 6
+  // / FindAttribute 7 / FindText 8 / GetAttributeValue 9 / GetBoundingRectangles 10 / GetText 12）。
+  // 数错一位就会把调用打到隔壁方法上——实测 RangeFromPoint 记成 4 直接 ACCESS_VIOLATION 崩进程。
+  getBoundingRectangles: 10,
   getText: 12,
 }
 
@@ -81,6 +138,7 @@ function bindings(koffi) {
       rangeArrayLength: koffi.proto('int __stdcall DstUiaRangeArrayLength(void *self, _Out_ int *length)'),
       rangeArrayGetElement: koffi.proto('int __stdcall DstUiaRangeArrayGetElement(void *self, int index, _Out_ void **range)'),
       clone: koffi.proto('int __stdcall DstUiaRangeClone(void *self, _Out_ void **range)'),
+      getBoundingRectangles: koffi.proto('int __stdcall DstUiaRangeGetBoundingRects(void *self, _Out_ void **rects)'),
       expand: koffi.proto('int __stdcall DstUiaRangeExpand(void *self, int unit)'),
       getText: koffi.proto('int __stdcall DstUiaRangeGetText(void *self, int maxLength, _Out_ void **text)'),
       release: koffi.proto('uint32 __stdcall DstUiaRelease(void *self)'),
@@ -91,6 +149,12 @@ function bindings(koffi) {
   cached.coInitializeEx = cached.ole32.func('int __stdcall CoInitializeEx(void *reserved, uint32_t coinit)')
   cached.coCreateInstance = cached.ole32.func('int __stdcall CoCreateInstance(DST_UIA_GUID *clsid, void *outer, uint32_t ctx, DST_UIA_GUID *iid, _Out_ void **out)')
   cached.sysFreeString = cached.oleaut32.func('void __stdcall SysFreeString(void *bstr)')
+  // GetBoundingRectangles 交出来的是一维 SAFEARRAY(double)，每 4 个一组是「x, y, w, h」。
+  cached.safeArrayGetLBound = cached.oleaut32.func('int __stdcall SafeArrayGetLBound(void *psa, uint32 dim, _Out_ int32 *lbound)')
+  cached.safeArrayGetUBound = cached.oleaut32.func('int __stdcall SafeArrayGetUBound(void *psa, uint32 dim, _Out_ int32 *ubound)')
+  cached.safeArrayAccessData = cached.oleaut32.func('int __stdcall SafeArrayAccessData(void *psa, _Out_ void **data)')
+  cached.safeArrayUnaccessData = cached.oleaut32.func('int __stdcall SafeArrayUnaccessData(void *psa)')
+  cached.safeArrayDestroy = cached.oleaut32.func('int __stdcall SafeArrayDestroy(void *psa)')
   return cached
 }
 
@@ -315,6 +379,76 @@ export function createUiaReader(koffi) {
   }
 
   /**
+   * 一段文本范围的**屏幕矩形**（GetBoundingRectangles）。
+   *
+   * 为什么要矩形而不是 RangeFromPoint：RangeFromPoint 会把点**就近吸附**到文本边界上
+   * ——鼠标按在桌面空白处时它也给一个"选区最后一个字符"的位置，于是"按下的地方在不在
+   * 选区里"永远为真，量不出任何东西（实测踩过）。矩形的语义是准的：点不在那些矩形里
+   * 就是不在。
+   *
+   * GetBoundingRectangles 交出来的是一维 SAFEARRAY(double)：每 4 个一组是「x, y, w, h」
+   * （屏幕物理像素）。拿不到（provider 不支持）返回 null。
+   */
+  const rangeRects = (range) => {
+    const out = [null]
+    if (invoke(b, range, SLOT.getBoundingRectangles, b.proto.getBoundingRectangles, out) !== 0) return null
+    const array = out[0]
+    if (array === null || array === undefined) return null
+    try {
+      const low = [0]
+      const high = [0]
+      if (b.safeArrayGetLBound(array, 1, low) !== 0) return null
+      if (b.safeArrayGetUBound(array, 1, high) !== 0) return null
+      const count = high[0] - low[0] + 1
+      if (!Number.isFinite(count) || count < 4 || count % 4 !== 0) return null
+      const data = [null]
+      if (b.safeArrayAccessData(array, data) !== 0) return null
+      let values
+      try {
+        values = b.koffi.decode(data[0], 'double', count)
+      } finally {
+        b.safeArrayUnaccessData(array)
+      }
+      const rects = []
+      for (let i = 0; i + 3 < count; i += 4) {
+        const width = Number(values[i + 2])
+        const height = Number(values[i + 3])
+        if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0) continue
+        rects.push({
+          left: Number(values[i]),
+          top: Number(values[i + 1]),
+          right: Number(values[i]) + width,
+          bottom: Number(values[i + 1]) + height,
+        })
+      }
+      return rects
+    } finally {
+      b.safeArrayDestroy(array)
+    }
+  }
+
+  /**
+   * **这次手势**（按下点或松开点）碰到这一段选区了吗。
+   *
+   * 为什么需要它：UIA 读到的选区可能是**上一次划词留下的**。菜单已经为它弹过一次、也已经
+   * 收起，这时用户随便一拖（拖窗口、拖滑块、在别处按一下），下次探针照样能读到那段旧文字
+   * ——于是"选中一次，菜单就再也甩不掉"。判据是位置：真的拖选/双击选词，按下的地方必然
+   * 落在选出来的那段文字上（选区就是从按下处开始的）；旧选区的按下点在别处。
+   *
+   * 容差由 `pointNearRects` 按行高算（见那里的说明），这里只负责"两个端点都看一眼"：
+   * 它们分别是选区的两端，用户从左边起手、一路拖到段落外面（或反过来）时，总有一端落在
+   * 选区里。
+   *
+   * @param rects - 选区矩形（`rangeRects` 的结果，可为 null）。
+   * @param points - 手势的按下点与松开点（屏幕物理坐标）。
+   * @returns true / false；拿不到矩形（provider 不支持）返回 null。
+   */
+  const gestureTouchesSelection = (rects, points) => {
+    if (rects === null) return null
+    return points.some((point) => pointNearRects(point, rects))
+  }
+
+  /**
    * 从"某个元素上的选区范围"得到上下文段落。
    * @returns \`{ unit, text, selection, className }\` 或 null（这个元素不适合）。
    */
@@ -348,18 +482,25 @@ export function createUiaReader(koffi) {
    * 才轮到剪贴板兜底（那才是唯一会动剪贴板的地方）。
    *
    * @param point - 屏幕坐标（手势落点，物理像素）。
+   * @param options.press - 这次手势**按下**的屏幕坐标：用来判断读到的选区是不是这次手势
+   *   选出来的（缺省时按 point 算——老调用方没有按下点，只能按落点近似）。
    * @returns
    *   - `null`：这一点上根本没有可读文本（应用不暴露 UIA 文本 / 读失败）——**不知道**
    *     用户选没选文字，调用方按未知处理（菜单照弹，点下去再退到剪贴板）；
    *   - `{ selection: '' }`：这一点上有 TextPattern 却没有选区——**确实没在选文字**；
-   *   - `{ selection: '...' }`：读到了选中的文字（`text`/`unit` 是它所在的段落，可能为空）。
+   *   - `{ selection: '', source: 'shell' }`：手势落在桌面/任务栏这类系统外壳上——同样确实
+   *     没在选文字（外壳不含可选文本），不按"未知"处理；
+   *   - `{ selection: '...' }`：读到了选中的文字（`text`/`unit` 是它所在的段落，可能为空），
+   *     并附带 `atGesture`——这段选区**这次手势碰到没有**（false = 落在别处，多半是上一次留下的）。
    */
-  const probe = (point) => {
+  const probe = (point, options = {}) => {
     const cleanup = []
     try {
       let seen = 0
       /** 读到"有 TextPattern 但没有选区"时的兜底结果。 */
       let empty = null
+      /** 点上的候选链里命中的系统外壳类名（桌面/任务栏）。 */
+      let shell = ''
       const blank = (iface, source) => ({
         selection: '',
         unit: '',
@@ -371,6 +512,10 @@ export function createUiaReader(koffi) {
       for (const { iface, source } of candidates(point)) {
         seen += 1
         cleanup.push(iface)
+        if (shell === '' && source === 'point') {
+          const name = String(property(iface, UIA_ClassNamePropertyId) || '')
+          if (SHELL_CLASSES.has(name)) shell = name
+        }
         const pattern = textPattern(iface)
         if (pattern === null) continue
         cleanup.push(pattern)
@@ -382,6 +527,7 @@ export function createUiaReader(koffi) {
         }
         cleanup.push(current)
         const selected = rangeText(current)
+        const rects = rangeRects(current)
         if (selected.trim() === '') {
           if (empty === null) empty = blank(iface, source)
           continue
@@ -393,9 +539,17 @@ export function createUiaReader(koffi) {
           unit: found === null ? '' : found.unit,
           text: found === null ? '' : found.text,
           className: found === null ? String(property(iface, UIA_ClassNamePropertyId) || '') : found.className,
+          /** 这段选区的屏幕矩形（最前面的几个）：诊断用，/probe 会带出来。 */
+          rects: rects === null ? null : rects.slice(0, 6),
+          /** 这次手势（按下点/松开点）碰到这段选区了吗（true / false / null=拿不到矩形）。 */
+          atGesture: gestureTouchesSelection(rects, [options.press ?? point, point]),
           source,
           candidates: seen,
         }
+      }
+      if (empty === null && shell !== '') {
+        // 手势落在桌面/任务栏上：外壳不含可选文本，这是"没在选文字"的强证据（而不是未知）。
+        return { selection: '', unit: '', text: '', className: shell, source: 'shell', pressInside: null, candidates: seen }
       }
       return empty
     } finally {

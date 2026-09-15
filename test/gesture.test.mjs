@@ -18,6 +18,9 @@ test('拖选：按下 → 移动超过阈值 → 松开，触发一次 drag', ()
   assert.equal(gestures.length, 1)
   assert.equal(gestures[0].kind, 'drag')
   assert.equal(gestures[0].x, 160)
+  // 按下的位置也要带上：调用方靠它判断"这次手势是不是选出了那段文字"
+  assert.equal(gestures[0].downX, 100)
+  assert.equal(gestures[0].downY, 100)
 })
 
 test('单击：位移小于阈值不触发任何手势', () => {
@@ -35,6 +38,8 @@ test('双击选词：两次快速同点点击触发一次 double', () => {
   push({ down: false, x: 101, y: 100, time: 140 })
   assert.equal(gestures.length, 1)
   assert.equal(gestures[0].kind, 'double')
+  assert.equal(gestures[0].downX, 101)
+  assert.equal(gestures[0].downY, 100)
 })
 
 test('两次间隔过久的点击不算双击', () => {
