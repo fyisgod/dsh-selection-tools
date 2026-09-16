@@ -21,6 +21,7 @@ import {
   type SettingsResponse,
 } from '../shared/protocol.js'
 import { detectLocale } from './api'
+import { ToolIcon } from './icons'
 
 /** 客户端上下文里本组件用到的面。 */
 interface ClientContext {
@@ -46,15 +47,29 @@ interface CatalogGroup {
 const COPY = {
   zh: {
     title: '划词工具',
-    hint: '在任意应用里选中文字 → 菜单里点解释/翻译。这里的设置对所有划词生效，改完立即保存。',
+    hint: '让每一次划词，都更懂你的意思。',
+    autoSave: '自动保存',
+    languageTitle: '翻译偏好',
+    languageDescription: '选择你习惯阅读的语言。',
+    modelTitle: '模型配置',
+    modelDescription: '为翻译与解释分别选择合适的模型。',
+    rulesTitle: '回答规则',
+    rulesDescription: '微调语气、格式与内容，让回答更合心意。',
+    stepSelect: '选中文字',
+    stepAction: '解释或翻译',
+    stepRead: '即刻阅读',
+    explainShort: '解释规则',
+    translateShort: '翻译规则',
+    customRules: '自定义',
+    defaultRules: '默认规则',
     targetLabel: '默认翻译至',
-    targetHint: '选「跟随原文自动」时保持老行为：中文译成英文，其它语言译成中文。',
+    targetHint: '自动模式下，中文译为英文，其他语言译为中文。',
     fallbackLabel: '反向目标语言',
-    fallbackHint: '当选中文字已经是「默认翻译至」的语言时，改译成这个语言（选「自动」则取镜像：原文是中文就译英文，否则译中文）。',
+    fallbackHint: '原文与目标语言相同时，使用此语言；自动模式下中英互译。',
     explainRulesLabel: '解释规则（交给模型的要求）',
-    explainRulesHint: '这段文字会原样作为「要求」写进解释的提示词，一行一条。',
+    explainRulesHint: '每行一条要求，将直接用于生成解释。',
     translateRulesLabel: '翻译规则（交给模型的要求）',
-    translateRulesHint: '这段文字会原样作为「要求」写进翻译的提示词，一行一条。',
+    translateRulesHint: '每行一条要求，将直接用于生成翻译。',
     restore: '恢复默认',
     translateModelLabel: '翻译使用的模型',
     explainModelLabel: '解释使用的模型',
@@ -76,7 +91,21 @@ const COPY = {
   },
   en: {
     title: 'Selection tools',
-    hint: 'Select text in any app, then pick Explain / Translate from the menu. Settings apply to every selection and save immediately.',
+    hint: 'A little more understanding, with every selection.',
+    autoSave: 'Auto-save on',
+    languageTitle: 'Translation preferences',
+    languageDescription: 'Read in the language that feels like home.',
+    modelTitle: 'Model preferences',
+    modelDescription: 'Choose the right model for each task.',
+    rulesTitle: 'Response rules',
+    rulesDescription: 'Fine-tune the tone, format, and level of detail.',
+    stepSelect: 'Select text',
+    stepAction: 'Explain or translate',
+    stepRead: 'Keep reading',
+    explainShort: 'Explanation rules',
+    translateShort: 'Translation rules',
+    customRules: 'Custom',
+    defaultRules: 'Default rules',
     targetLabel: 'Translate into',
     targetHint: '"Follow the source" keeps the original behaviour: Chinese → English, anything else → Chinese.',
     fallbackLabel: 'Fallback target',
@@ -216,7 +245,7 @@ function ModelSeatField(props: {
     catalogsReady
       ? createElement(
           'select',
-          { className: 'dst-set-input', value: current, onChange: (event: any) => pickModel(String(event.target.value)) },
+          { className: 'dst-set-input', 'aria-label': label, value: current, onChange: (event: any) => pickModel(String(event.target.value)) },
           [
             createElement('option', { key: '', value: '' }, copy.followSession),
             ...flat.map((item) =>
@@ -234,6 +263,7 @@ function ModelSeatField(props: {
           createElement('input', {
             className: 'dst-set-input',
             placeholder: copy.provider,
+            'aria-label': label + ' · ' + copy.provider,
             value: seat?.provider ?? '',
             onChange: (event: any) =>
               onChange({ provider: String(event.target.value), model: seat?.model ?? '' }),
@@ -241,6 +271,7 @@ function ModelSeatField(props: {
           createElement('input', {
             className: 'dst-set-input',
             placeholder: copy.model,
+            'aria-label': label + ' · ' + copy.model,
             value: seat?.model ?? '',
             onChange: (event: any) => onChange({ provider: seat?.provider ?? '', model: String(event.target.value) }),
           }),
@@ -256,6 +287,7 @@ function ModelSeatField(props: {
           'select',
           {
             className: 'dst-set-input',
+            'aria-label': label + ' · ' + copy.effortLabel,
             value: seat.reasoningEffort ?? '',
             onChange: (event: any) => {
               const effort = String(event.target.value)
@@ -275,7 +307,7 @@ function ModelSeatField(props: {
     )
   }
   rows.push(createElement('span', { className: 'dst-set-hint' }, catalogsReady ? hint : copy.manualHint))
-  return createElement('div', { className: 'dst-set-field' }, rows)
+  return createElement('div', { className: 'dst-set-field' }, ...rows)
 }
 
 /**
@@ -358,7 +390,7 @@ export function SettingsSection(props: { ctx: ClientContext }): ReactNode {
   }
 
   const statusText =
-    status === 'saving' ? copy.saving : status === 'saved' ? copy.saved : status === 'error' ? copy.failed + '：' + error : ''
+    status === 'saving' ? copy.saving : status === 'saved' ? copy.saved : status === 'error' ? copy.failed : copy.autoSave
 
   const languageField = (
     label: string,
@@ -370,10 +402,10 @@ export function SettingsSection(props: { ctx: ClientContext }): ReactNode {
     createElement(
       'div',
       { className: 'dst-set-field', key },
-      createElement('span', { className: 'dst-set-label' }, label),
+      createElement('label', { className: 'dst-set-label', htmlFor: 'dst-' + key }, label),
       createElement(
         'select',
-        { className: 'dst-set-input', value, onChange: (event: any) => update({ [key]: String(event.target.value) } as Partial<SelectionToolsSettings>) },
+        { id: 'dst-' + key, className: 'dst-set-input', value, onChange: (event: any) => update({ [key]: String(event.target.value) } as Partial<SelectionToolsSettings>) },
         languageOptions(autoLabel).map((option) => createElement('option', { key: option.id, value: option.id }, option.label)),
       ),
       createElement('span', { className: 'dst-set-hint' }, hint),
@@ -387,53 +419,95 @@ export function SettingsSection(props: { ctx: ClientContext }): ReactNode {
     fallback: string,
   ): ReactNode =>
     createElement(
-      'div',
-      { className: 'dst-set-field', key },
+      'details',
+      { className: 'dst-set-rule', key },
+      createElement(
+        'summary',
+        { className: 'dst-set-rule-summary' },
+        createElement(ToolIcon, { name: key === 'explainRules' ? 'sparkle' : 'language', size: 18 }),
+        createElement('span', { className: 'dst-set-rule-name' }, label),
+        createElement('span', { className: 'dst-set-rule-badge', 'data-custom': value !== fallback }, value === fallback ? copy.defaultRules : copy.customRules),
+        createElement('span', { className: 'dst-set-rule-chevron' }, createElement(ToolIcon, { name: 'chevron', size: 16 })),
+      ),
       createElement(
         'div',
-        { className: 'dst-set-labelrow' },
-        createElement('span', { className: 'dst-set-label' }, label),
-        createElement('button', { type: 'button', className: 'dst-set-link', onClick: () => update({ [key]: fallback } as Partial<SelectionToolsSettings>) }, copy.restore),
+        { className: 'dst-set-rule-body' },
+        createElement('textarea', {
+          className: 'dst-set-textarea',
+          'aria-label': label,
+          rows: 6,
+          spellCheck: false,
+          value,
+          onChange: (event: any) => update({ [key]: String(event.target.value) } as Partial<SelectionToolsSettings>),
+        }),
+        createElement('div', { className: 'dst-set-labelrow' },
+          createElement('span', { className: 'dst-set-hint' }, hint),
+          createElement('button', { type: 'button', className: 'dst-set-link', disabled: value === fallback, onClick: () => update({ [key]: fallback } as Partial<SelectionToolsSettings>) }, copy.restore),
+        ),
       ),
-      createElement('textarea', {
-        className: 'dst-set-textarea',
-        rows: 6,
-        spellCheck: false,
-        value,
-        onChange: (event: any) => update({ [key]: String(event.target.value) } as Partial<SelectionToolsSettings>),
-      }),
-      createElement('span', { className: 'dst-set-hint' }, hint),
+    )
+
+  const group = (icon: 'language' | 'model' | 'rules', title: string, description: string, content: ReactNode) =>
+    createElement('section', { className: 'dst-set-card', 'aria-label': title },
+      createElement('div', { className: 'dst-set-card-heading' },
+        createElement('span', { className: 'dst-set-card-icon' }, createElement(ToolIcon, { name: icon })),
+        createElement('div', null,
+          createElement('h3', { className: 'dst-set-card-title' }, title),
+          createElement('p', { className: 'dst-set-hint' }, description),
+        ),
+      ),
+      content,
     )
 
   return createElement(
     'div',
     { className: 'dst-set-section' },
-    createElement('h2', { className: 'dst-set-title' }, copy.title),
-    createElement('p', { className: 'dst-set-hint dst-set-intro' }, copy.hint),
-    languageField(copy.targetLabel, copy.targetHint, settings.targetLanguage, copy.auto, 'targetLanguage'),
-    languageField(copy.fallbackLabel, copy.fallbackHint, settings.fallbackLanguage, copy.autoMirror, 'fallbackLanguage'),
-    createElement(ModelSeatField, {
-      key: 'translate-model',
-      label: copy.translateModelLabel,
-      hint: copy.modelHint,
-      copy,
-      seat: settings.translateModel,
-      groups,
-      catalogsReady,
-      onChange: (seat: ModelSeat | null) => update({ translateModel: seat }),
-    }),
-    createElement(ModelSeatField, {
-      key: 'explain-model',
-      label: copy.explainModelLabel,
-      hint: copy.modelHint,
-      copy,
-      seat: settings.explainModel,
-      groups,
-      catalogsReady,
-      onChange: (seat: ModelSeat | null) => update({ explainModel: seat }),
-    }),
-    rulesField('explainRules', copy.explainRulesLabel, copy.explainRulesHint, settings.explainRules, DEFAULT_EXPLAIN_RULES),
-    rulesField('translateRules', copy.translateRulesLabel, copy.translateRulesHint, settings.translateRules, DEFAULT_TRANSLATE_RULES),
-    createElement('div', { className: 'dst-set-status' }, createElement('span', { className: status === 'error' ? 'dst-set-error' : '' }, statusText)),
+    createElement('header', { className: 'dst-set-header' },
+      createElement('span', { className: 'dst-set-brand' }, createElement(ToolIcon, { name: 'selection', size: 26 })),
+      createElement('div', { className: 'dst-set-heading' },
+        createElement('h2', { className: 'dst-set-title' }, copy.title),
+        createElement('p', { className: 'dst-set-hint dst-set-intro' }, copy.hint),
+      ),
+      createElement('span', { className: 'dst-set-save', 'data-state': status, role: 'status', 'aria-live': 'polite' },
+        status === 'saving' ? createElement('span', { className: 'dst-set-spinner', 'aria-hidden': true }) : createElement(ToolIcon, { name: 'check', size: 14 }),
+        statusText,
+      ),
+    ),
+    createElement('div', { className: 'dst-set-workflow', 'aria-label': copy.hint },
+      createElement('span', { className: 'dst-set-step' }, createElement(ToolIcon, { name: 'selection', size: 16 }), copy.stepSelect),
+      createElement(ToolIcon, { name: 'arrow', size: 14 }),
+      createElement('span', { className: 'dst-set-step' }, createElement(ToolIcon, { name: 'sparkle', size: 16 }), copy.stepAction),
+      createElement(ToolIcon, { name: 'arrow', size: 14 }),
+      createElement('span', { className: 'dst-set-step' }, createElement(ToolIcon, { name: 'check', size: 16 }), copy.stepRead),
+    ),
+    status === 'error' ? createElement('div', { className: 'dst-set-error-banner', role: 'alert' }, copy.failed + '：' + error,
+      createElement('button', { type: 'button', className: 'dst-set-link', onClick: () => update({}) }, copy.retry),
+    ) : null,
+    group('language', copy.languageTitle, copy.languageDescription,
+      createElement('div', { className: 'dst-set-grid' },
+        languageField(copy.targetLabel, copy.targetHint, settings.targetLanguage, copy.auto, 'targetLanguage'),
+        languageField(copy.fallbackLabel, copy.fallbackHint, settings.fallbackLanguage, copy.autoMirror, 'fallbackLanguage'),
+      ),
+    ),
+    group('model', copy.modelTitle, copy.modelDescription,
+      createElement('div', { className: 'dst-set-grid' },
+        createElement(ModelSeatField, {
+          label: copy.translateModelLabel, hint: copy.modelHint, copy,
+          seat: settings.translateModel, groups, catalogsReady,
+          onChange: (seat: ModelSeat | null) => update({ translateModel: seat }),
+        }),
+        createElement(ModelSeatField, {
+          label: copy.explainModelLabel, hint: copy.modelHint, copy,
+          seat: settings.explainModel, groups, catalogsReady,
+          onChange: (seat: ModelSeat | null) => update({ explainModel: seat }),
+        }),
+      ),
+    ),
+    group('rules', copy.rulesTitle, copy.rulesDescription,
+      createElement('div', { className: 'dst-set-rules' },
+        rulesField('explainRules', copy.explainShort, copy.explainRulesHint, settings.explainRules, DEFAULT_EXPLAIN_RULES),
+        rulesField('translateRules', copy.translateShort, copy.translateRulesHint, settings.translateRules, DEFAULT_TRANSLATE_RULES),
+      ),
+    ),
   )
 }

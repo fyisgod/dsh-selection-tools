@@ -23,6 +23,7 @@ import {
 } from 'react'
 
 import { detectLocale, startRun, stopRun } from './api'
+import { ToolIcon } from './icons'
 import { MAX_CONTEXT_LENGTH, MAX_SELECTION_LENGTH, type SelectionAction } from '../shared/protocol.js'
 
 /** 客户端上下文里本插件用到的面。 */
@@ -78,8 +79,8 @@ function markdownLabels(locale: 'zh' | 'en'): unknown {
 /** 界面文案。 */
 const COPY = {
   zh: {
-    explain: 'DeepSeek Harness 解释',
-    translate: 'DeepSeek Harness 翻译',
+    explain: '解释',
+    translate: '翻译',
     panelExplain: '解释',
     panelTranslate: '翻译',
     expand: '展开原文',
@@ -94,8 +95,8 @@ const COPY = {
     empty: '（没有文本输出）',
   },
   en: {
-    explain: 'Explain with DeepSeek Harness',
-    translate: 'Translate with DeepSeek Harness',
+    explain: 'Explain',
+    translate: 'Translate',
     panelExplain: 'Explain',
     panelTranslate: 'Translate',
     expand: 'Show full source',
@@ -142,8 +143,8 @@ const PANEL_H = 480
 const PANEL_MIN_W = 280
 const PANEL_MIN_H = 180
 const MARGIN = 20
-const MENU_W = 232
-const MENU_H = 96
+const MENU_W = 192
+const MENU_H = 120
 const LAYOUT_KEY = 'dsh.selection-tools.layout'
 
 const viewport = () => ({
@@ -666,10 +667,12 @@ export function Overlay(props: { ctx: ClientContext }): ReactNode {
         },
         createElement('span', { className: 'dst-menu-item-icon' }, icon(iconName, 16)),
         createElement('span', { className: 'dst-menu-item-label' }, label),
+        createElement('span', { className: 'dst-menu-arrow' }, createElement(ToolIcon, { name: 'arrow', size: 14 })),
       )
     menuNode = createElement(
       'div',
-      { className: 'dst-menu', style: { left: x, top: y, width: MENU_W }, role: 'menu' },
+      { className: 'dst-menu', style: { left: x, top: y, width: MENU_W }, role: 'menu', 'aria-label': 'Selection tools' },
+      createElement('div', { className: 'dst-menu-caption', role: 'presentation' }, 'DeepSeek Harness', createElement('span', { 'aria-hidden': true }, 'Esc')),
       item('explain', copy.explain, 'sparkle'),
       item('translate', copy.translate, 'globe'),
     )
@@ -734,6 +737,7 @@ export function Overlay(props: { ctx: ClientContext }): ReactNode {
               'span',
               { className: 'dst-panel-title' },
               panel.action === 'translate' ? copy.panelTranslate : copy.panelExplain,
+              createElement('span', { className: 'dst-panel-brand' }, 'Harness'),
             ),
             createElement(
               'span',
@@ -753,8 +757,9 @@ export function Overlay(props: { ctx: ClientContext }): ReactNode {
             createElement(
               'div',
               { className: 'dst-source', 'data-expanded': expanded ? 'true' : 'false' },
-              panel.source,
-              panel.source.length > 160
+              createElement('span', { className: 'dst-source-label' }, locale === 'zh' ? '原文' : 'SOURCE'),
+              createElement('div', { className: 'dst-source-text' }, panel.source),
+              (panel.source.length > 80 || panel.source.split('\n').length > 3)
                 ? createElement(
                     'button',
                     { type: 'button', className: 'dst-source-toggle', onClick: () => setExpanded((value) => !value) },
@@ -774,7 +779,7 @@ export function Overlay(props: { ctx: ClientContext }): ReactNode {
           ),
           createElement(
             'footer',
-            { className: 'dst-panel-foot' },
+            { className: 'dst-panel-foot', role: 'status', 'aria-live': 'polite' },
             createElement('span', { className: 'dst-dot', 'data-state': panel.status }),
             createElement('span', { className: panel.status === 'error' ? 'dst-error' : '' }, statusText),
             panel.status === 'error' && panel.error !== ''
