@@ -605,7 +605,7 @@ async function waitFor(promise, ms) {
  * **两级预算**：先在 budgetMs 内等探针（正常的探针 10–30ms 就回来了，这一级几乎用不满）；
  * 超时说明它只是**慢**（跨进程 provider、无障碍树刚被焐热、系统一时繁忙），不是没有答案
  * ——探针本身还在跑，所以再宽限一段（budgetMs 的三倍，上限 1s）等它的结论。只有宽限期
- * 也用完才按"未知"处理：照弹，点菜单项时还有剪贴板兜底。
+ * 也用完才按"未知"处理：拖选保留剪贴板兜底；双击没有选区证据就不弹。
  *
  * 为什么要有宽限期：跳过去直接照弹的话，用户"在别处随便一拖"刚好撞上一次慢探针，
  * 菜单又会冒出来——那正是"选中一次之后菜单甩不掉"的另一条来路。宽限期的代价只是
@@ -614,14 +614,15 @@ async function waitFor(promise, ms) {
  * @param previous - 上一次菜单收起时绑的那段文字（见 policy.mjs 的 menuDecision）。
  * @returns `{ open, reason }`（见 policy.mjs 的 menuDecision）。
  */
-async function decideMenu(pending, budgetMs, previous) {
-  if (contextReader === null || budgetMs <= 0) return menuDecision(null, previous)
+async function decideMenu(pending, budgetMs, previous, kind) {
+  if (contextReader === null || budgetMs <= 0) return menuDecision(null, previous, { kind })
   const first = await waitFor(pending, budgetMs)
-  if (first !== 'timeout') return menuDecision(first, previous)
+  if (first !== 'timeout') return menuDecision(first, previous, { kind })
   const grace = Math.min(1000, budgetMs * 3)
   const second = await waitFor(pending, grace)
-  if (second === 'timeout') return { open: true, reason: 'timeout' }
-  return menuDecision(second, previous)
+  // 宽限期也用完：结论仍是"读不到"，照走同一份策略（双击因此不弹；拖选照老行为弹）。
+  if (second === 'timeout') return menuDecision(null, previous, { kind, reason: 'timeout' })
+  return menuDecision(second, previous, { kind })
 }
 
 /**
@@ -995,7 +996,7 @@ async function handleGesture(gesture, isCurrent) {
     pending: null,
   }
   const pending = startProbe(selection)
-  const decision = await decideMenu(pending, MENU_DECIDE_MS, state.lastMenuSelection)
+  const decision = await decideMenu(pending, MENU_DECIDE_MS, state.lastMenuSelection, gesture.kind)
   state.lastMenuDecision = { open: decision.open, reason: decision.reason, kind: gesture.kind, at: Date.now() }
   state.recentDecisions.push({
     at: state.lastMenuDecision.at,
@@ -1179,7 +1180,7 @@ const server = createServer((req, res) => {
         const result = await contextReader.probe(point, { retries, press })
         respondJson(res, 200, {
           ok: true,
-          decision: menuDecision(result),
+          decision: menuDecision(result, '', { kind: typeof body.kind === 'string' ? body.kind : '' }),
           selection: result === null ? '' : result.selection,
           context: result === null ? '' : result.text,
           source: result === null ? '' : result.source,

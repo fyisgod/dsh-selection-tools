@@ -10,6 +10,7 @@ import { test } from 'node:test'
 
 import { menuDecision, pickSelection } from '../companion/policy.mjs'
 import { pointNearRects } from '../companion/native/uia.mjs'
+import { createGestureDetector } from '../companion/gesture.mjs'
 
 test('手势落在桌面/任务栏这类系统外壳上：外壳不含可选文本，不弹', () => {
   assert.deepEqual(menuDecision({ selection: '', source: 'shell' }), { open: false, reason: 'shell' })
@@ -19,6 +20,76 @@ test('手势落在桌面/任务栏这类系统外壳上：外壳不含可选文�
 test('读不到 UIA 文本时照弹：不知道用户选没选，点菜单项还有剪贴板兜底（唯一照弹的未知情形）', () => {
   assert.deepEqual(menuDecision(null), { open: true, reason: 'unknown' })
   assert.deepEqual(menuDecision(undefined), { open: true, reason: 'unknown' })
+})
+
+test('双击且探针读不到任何文本元素：不弹（双击图标/列表项/画布/空白处本来就不是划词）', () => {
+  // 实测：/status 的 recentDecisions 里，误弹的双击清一色是 reason=unknown|timeout
+  // 且 probe.state=none（探针什么也没读到）。双击的语义是"选一个词"，读不到任何文本
+  // 元素就说明这一点上多半根本没在选文字。
+  assert.deepEqual(menuDecision(null, '', { kind: 'double' }), { open: false, reason: 'double-unverified' })
+  assert.deepEqual(menuDecision(undefined, '', { kind: 'double' }), { open: false, reason: 'double-unverified' })
+  // 等满两级预算也没等到结论的那一档走同一条判定（探针慢/不可读，不是"读到了空选区"）。
+  assert.deepEqual(menuDecision(null, '', { kind: 'double', reason: 'timeout' }), { open: false, reason: 'double-unverified' })
+})
+
+test('拖选仍然照弹：UIA 读不到文字的窗口里拖拽照样能选出文字，剪贴板兜底还在（这次只收双击）', () => {
+  assert.deepEqual(menuDecision(null, '', { kind: 'drag' }), { open: true, reason: 'unknown' })
+  assert.deepEqual(menuDecision(null, ''), { open: true, reason: 'unknown' })
+  // 拖选那一路的 timeout 诊断不能丢（/status 靠它区分"探针慢"和"探针不可读"）。
+  assert.deepEqual(menuDecision(null, '', { kind: 'drag', reason: 'timeout' }), { open: true, reason: 'timeout' })
+})
+
+test('双击真的选中了文字：必须碰到这次选区才弹', () => {
+  assert.deepEqual(
+    menuDecision({ selection: 'Go 调度器', source: 'point', atGesture: true }, '', { kind: 'double' }),
+    { open: true, reason: 'selection' },
+  )
+  // 双击读到的可能是旧选区/附近文本，但这次手势没碰到它：不能沿用拖选的
+  // “文字不同就认”兜底，否则双击空白处也会拿旧文本呼出菜单。
+  assert.deepEqual(
+    menuDecision({ selection: 'Go', source: 'focused', atGesture: false }, '别的文字', { kind: 'double' }),
+    { open: false, reason: 'double-not-at-gesture' },
+  )
+  assert.deepEqual(
+    menuDecision({ selection: 'Go', source: 'point', atGesture: null }, '', { kind: 'double' }),
+    { open: false, reason: 'double-not-at-gesture' },
+  )
+})
+
+test('双击未命中选区：不同文字、首次划词及焦点旧选区都不能绕过验证', () => {
+  // 真实日志：双击读到 3/10/4/1 字，atGesture=false 却被判为 selection。
+  for (const length of [3, 10, 4, 1]) {
+    const selection = '字'.repeat(length)
+    for (const source of ['point', 'focused']) {
+      for (const previous of ['', '别处的文字', selection]) {
+        for (const atGesture of [false, null, undefined]) {
+          assert.deepEqual(menuDecision({ selection, source, atGesture }, previous, { kind: 'double' }),
+            { open: false, reason: 'double-not-at-gesture' })
+        }
+      }
+    }
+  }
+})
+
+test('鼠标双击采样传入策略：读到其他位置文字时不会发出打开菜单指令', () => {
+  for (const atGesture of [false, null, true]) {
+    const decisions = []
+    const detector = createGestureDetector({ onGesture: (gesture) => {
+      decisions.push(menuDecision({ selection: '残留文字', source: 'point', atGesture }, '', { kind: gesture.kind }))
+    } })
+    for (const [down, time] of [[true, 0], [false, 150], [true, 230], [false, 380]]) {
+      detector.push({ down, time, x: 1915, y: 1085 })
+    }
+    assert.equal(decisions.length, 1)
+    assert.equal(decisions[0].open, atGesture === true)
+  }
+})
+
+test('双击空选区即使命中矩形也不弹；非空同词再次命中仍能弹', () => {
+  for (const selection of ['', '   ', '\n']) {
+    assert.equal(menuDecision({ selection, atGesture: true }, '', { kind: 'double' }).open, false)
+  }
+  assert.equal(menuDecision({ selection: '同词', atGesture: true }, '同词', { kind: 'double' }).open, true)
 })
 
 test('这次手势碰到了这段选区（按下点/松开点在选区里）：弹——这次手势选的就是它', () => {
