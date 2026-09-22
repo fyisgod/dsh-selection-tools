@@ -21,7 +21,7 @@ Select text in any Windows app — the Harness agent explains or translates it i
 ## 它做什么
 
 - **系统级划词**（主路径）：在**任何 Windows 应用**里拖选或双击选词 → 以选区右下角为锚点、第四象限弹出菜单（`DeepSeek Harness 解释` / `DeepSeek Harness 翻译`）→ 点击后弹出置顶悬浮窗，流式显示 Harness agent 的回答。
-- **划词不碰剪贴板**：菜单在手势落下的那一刻就弹（不再"先注入 Ctrl+C 取词、取到才弹"——那条路上取词失败就等于菜单呼不出来）；选中的文字留到**点菜单项时**才解析，先走 UI Automation 直接读选区，只有它读不到才注入一次 Ctrl+C 读剪贴板兜底。
+- **划词尽量不碰剪贴板**：菜单在手势落下的那一刻就弹（不再"先注入 Ctrl+C 取词、取到才弹"——那条路上取词失败就等于菜单呼不出来）；选中的文字留到**点菜单项时**才解析，先走 UI Automation 直接读选区，只有它读不到才注入一次 Ctrl+C 读剪贴板兜底。唯一会在**弹菜单之前**碰剪贴板的情形：应用对 UIA 完全说不出话（WPS 的 Qt 版这类），那时只能注入一次 Ctrl+C 来核实"这次手势到底有没有选中文字"（见下文），`DSH_SELECTION_CONFIRM=0` 可关掉。
 - **一份选区只弹一次菜单**：菜单以任何方式收起（超时、Esc、点到别处、点了菜单项）之后，那份**旧选区还留在应用里也不会让菜单再冒出来**——只有重新划词（选出了新的一段）才会再弹。少了这条，"选中一次"之后就变成"到哪里拖菜单都会出来"。
 - **菜单与回答窗口彼此独立**：划词菜单有显示时限（默认 **3.6 秒**），超时、按 Esc、或用**任意鼠标键**点到别处都会收起；回答窗口**只有手动关闭（标题栏 ✕）才会消失**——新划词不会动它，**窗口里的内容也只在点菜单的解释/翻译时才会换**（再选一段文字、点窗口、滚轮都不会把结果顶掉）。
 - **标题栏三个按钮**（从右往左：关闭 / 复制 / 朗读）：**复制**把回答写进剪贴板，页脚回执「已复制 / 复制失败」；**朗读**用 Windows 自带的语音（SAPI，进程内 COM，不起额外进程）念出选中的原文，再点一次就停，读完自动复原；没有内容可复制/没有原文可读时对应图标画成灰的。
@@ -147,6 +147,9 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 | `DSH_SELECTION_MENU_DECIDE_MS` | `280` | 手势落下后给 UIA 的决策窗口：这么长时间内读到"有没有选中文字"就按它办（有选区 → 弹；**这点上没有选区** → 不弹）；超时就**再宽限三倍时长（上限 1s）**等探针的结论（探针还在跑，只是慢），宽限也用完才按"未知"照弹（`0` = 手势一到就弹，不做任何过滤）。 |
 | `DSH_SELECTION_TEXT_SOURCE` | `auto` | 选区文字从哪来：`auto` = UIA 优先、读不到才用剪贴板；`uia` = 只用 UIA（读不到就报错，绝不碰剪贴板）；`clipboard` = 直接用剪贴板（某个应用 UIA 读得不准时的逃生舱）。 |
 | `DSH_SELECTION_MENU_PROBE_RETRIES` | `3` | 菜单弹出时 UIA 预读的重试次数（Chromium/WebView2 冷启动第一次必失败，重试同时替后面的解析把无障碍树焐热）。 |
+| `DSH_SELECTION_PRESS_PROBE` | `1` | 鼠标**按下**时要不要拍一张"手势之前的选区"快照：只有它能把"拖动一个已选中的元素"（WPS/Office 的 PPT 形状、Excel 单元格）和"拖选文字"分开。`0` = 不拍（每次按下少一次 UIA 读取，代价是拖动已选中的元素又会弹菜单）。 |
+| `DSH_SELECTION_PRESS_WAIT_MS` | `120` | 等这张按下快照的上限（毫秒）：正常早就回来了，只有"按下到松开特别快"的拖拽才会真等；超时按"没拍到"处理。 |
+| `DSH_SELECTION_CONFIRM` | `1` | UIA 说不出话时（WPS/Office 的 Qt 版这类不暴露文档文本的应用），要不要用**剪贴板**核实"这次手势到底有没有选中文字"：注入一次 Ctrl+C，真选中文字就会复制出文字，拖动形状/窗口则什么都复制不出来。`0` = 不核实（退回老行为：拖选照弹、双击不弹）。 |
 | `DSH_SELECTION_CLICK_PROBE_RETRIES` | `1` | 点菜单项时补读 UIA 的重试次数；再多只是拖延剪贴板兜底。 |
 | `DSH_SELECTION_CLIPBOARD_OWNER` | `1` | 取词时是否核对"这次剪贴板写入不是别的进程写的"；`0` = 退回老行为（只看序号变化）——核对误伤了某个应用、取不到词时才关。 |
 | `DSH_SELECTION_MENU_TIMEOUT_MS` | `3600` | 划词菜单的显示时限（毫秒）。 |
@@ -161,11 +164,23 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
   - 读到选区里有文字、**而且按下的地方就在这段选区里** → 弹（这次手势选的就是它）；
   - 读到选区里有文字，但按下的地方不在选区里 → **不弹**（`stale-selection`）：那是**上一次划词留下的旧选区**，菜单已经为它弹过一次、也已经收起；
   - 这一点上确实没有选区（元素带 TextPattern 却报不出选区，或者落在桌面/任务栏这类不含可选文本的系统外壳上）→ **不弹**（`no-selection` / `shell`）：拖窗口、拖滑块、拖桌面、双击图标都不该弹；
-  - 什么都没读到（应用不暴露 UIA 文本、宽限期也用完）→ **照弹**：未知时倒向"用户确实想划词"，点菜单项时还有剪贴板兜底。
+  - **按下时读到的就是这一段、松开时还是它** → **不弹**（`unchanged-selection`）：这次手势压根没改动选区。办公套件里最典型——WPS/Office 的 PPT 里选中一个形状/文本框再拖动它、Excel 里拖一个已选中的单元格/图表，UIA 从按下到松开一路都报着"这个对象被选中"（按下点和松开点当然都落在元素里），只看松开那一刻就会在用户**移动元素**时冒出菜单。判据是按下那一刻拍的快照（`pressProbe`，`DSH_SELECTION_PRESS_PROBE` 可关）；
+  - 什么都没读到（应用不暴露 UIA 文本、宽限期也用完）→ **不表态**（`open: null`），交给**剪贴板核实**（见下一条）。
   这几条都有单测钉着（`test/policy.test.mjs`），决策理由每次写进 `/status` 的 `lastMenuDecision`。
+- **UIA 说不出话时，只能让剪贴板说话**（WPS/Office 的 Qt 版这一整类应用）：实测把 WPS PPT 的 UIA 树整棵走一遍（376 个节点），带 TextPattern 的只有功能区的两个长条文本框——**幻灯片里的文字、形状、选区，UIA 一个字都读不到**。于是"这一点上有没有选中文字"这个问题，UIA 永远答"不知道"：拖动一个已选中的形状/文本框、拖窗口标题栏、拖画布，全都落进"读不到"那一档，而那一档原本是**照弹**的（`reason=unknown`）——用户看到的就是"选中元素并拖动也弹菜单"；双击则落在同一档的另一面（不弹），于是"双击选词也呼不出来"。
+  现在这一档改成 **`open: null`（不表态）**，由 `main.mjs` 的 `confirmByClipboard` 用剪贴板核实一次：注入一次 Ctrl+C——
+  - **真选中了文字** → 复制出文字 → 弹菜单（`reason=clipboard`），顺手把这文字记进这次选区，点菜单项时不用再复制一遍；
+  - **拖动形状/窗口** → 什么文字都复制不出来 → **不弹**（`reason=unconfirmed`）——这就是"拖动元素不再弹菜单"的判据；
+  - **核不出来**（终端窗口、用户此刻正按着 Ctrl+C、或者 `DSH_SELECTION_CONFIRM=0`）→ 退回老行为（拖选照弹、双击不弹，见 `policy.mjs` 的 `unknownFallback`）。
+  代价与安全边界全交给 `selection.mjs`：只在前台窗口确实是 UIA 说不出话的应用里才注入；用户正按 Ctrl+C 就一次都不注入；只认前台窗口自己写的那次；读完把用户原来的剪贴板内容放回去。**额外一条**：这次注入是我们自己发的，所以"一个字都没复制出来"时也要把用户原来的文字放回去（`restoreWhenEmpty`）——否则拖动一个形状就会把用户的剪贴板悄悄换成那个形状。
+- **`unchanged-selection` 与剪贴板核实是两条互补的路**：前者管"UIA 读得到选区、但用户其实在移动一个已选中的元素"（Office 的 UIA 版、LibreOffice 这类），后者管"UIA 完全读不到、只能靠复制来问"（WPS 的 Qt 版）。两条都在，才既不误弹也不吞划词。
+- **“这次手势有没有选出新东西”只能在按下的那一刻量**：拖动一个**已经选中**的元素时，UIA 给出的选区跟真划词一模一样（都是“这一段被选中了”，按下点/松开点也都在选区里），唯一的差别是**拖之前它就选中了、拖完还是它**。所以快照必须在按下时拍（`gesture.mjs` 的 `onPress` → `main.mjs` 的 `startPressProbe`）：拖完再读到的已经是被这次手势改过的选区了，问不出“本来是什么”。两个配套细节：
+  - **双击的第二下不重拍**（`onPress.second`）：双击要的是**这一串点击开始之前**的选区（第一下按下时，文本应用会把旧选区收成插入符），第二下时选中的词已经出来了，拿它当“之前”会把双击选词整个判成“没改动”。
+  - **决策在途时不拍**（`main.mjs` 的 `deciding`）：读取器同一时刻只保留最新的一次请求，决策等结论时再拍一张会把**这次决策的探针**顶掉（结果变成“读不到”），菜单反而会在随手一拖时冒出来。那一档按“没拍到”处理，判定完全退回改动前的行为。
+  - 拍不到（应用不响应、按下到松开特别快、`DSH_SELECTION_PRESS_PROBE=0`）时的取舍是**照弹**：宁可偶尔多弹一次，也不能因为多拍一张快照而吞掉正常划词。`/status` 的 `pressProbe` 与 `recentDecisions[].pressProbe` 会说清这张快照拍到了什么。
 - **“手势碰到这段选区了吗”必须用矩形量，而且余量要按行高走**：先用 `GetBoundingRectangles` 拿选区的屏幕矩形（`RangeFromPoint` 不行——它会把点**就近吸附**到文本边界上，鼠标按在桌面空白处也照样回一个“选区最后一个字符”的位置，这个判断就永远为真、什么都量不出来）。判定本身抽成纯函数 `pointNearRects`：**余量取 `max(8, 矩形高度)`**——拖选的锚点会吸附到字符边界，字符有多宽误差就能有多大，**150% 缩放下一个字 15–30px**，写死 8px 会把“从右往左拖”“按在行尾空白处起手”这类正常划词误判成旧选区（用户报的“经常弹不出来”就是这条）。**按下点与松开点都要看**：它们是选区的两端，用户从文字里起手一路拖到段落外面（或反过来）时，总有一端落在选区里。以及一个坑：`GetBoundingRectangles` 交出来的矩形是 `{left, top, right, bottom}`，**没有 height 字段**——早期实现读 `rect.height` 得到 `undefined`，`Math.max(8, undefined)` 是 `NaN`，比较全 false，于是“手势碰到选区了吗”恒为 false、正常划词全被当成旧选区吃掉（`test/policy.test.mjs` 现在钉着这条）。 另外两个实现细节：矩形是 `SAFEARRAY(double)`（每 4 个一组 x/y/w/h），`SafeArrayAccessData` 之后按 `double` 数组解码；**槽位号必须对着 IDL 数**——`IUIAutomationTextPattern` 里 `RangeFromPoint` 排在 `RangeFromChild` 前面（3/4），`IUIAutomationTextRange` 里 `GetBoundingRectangles` 是 10，数错一位把调用打到隔壁方法上会直接 ACCESS_VIOLATION 崩掉伴生进程（实测踩过）。
 - **宽限期是为了"慢"，不是为了"读不到"**：探针正常 10–30ms 就回来；慢的那一次（跨进程 provider、无障碍树刚被焐热）如果直接按"未知"照弹，用户随手一拖就会撞出菜单来。所以决策分两级：先等 `DSH_SELECTION_MENU_DECIDE_MS`，超时再等它三倍时长（上限 1s）——结论一回来就出菜单，只是比"照弹"更晚一点，而不会把旧选区或没选字的手势也弹出来。
-- **选区文字 UIA 优先、剪贴板垫底**：点菜单项时才解析选区——先等菜单弹出时就开始的 UIA 预读（一次调用同时拿到**选区**与**段落**），再补读一次（那时无障碍树已热），最后才注入 Ctrl+C 读剪贴板。**全插件只有这最后一处会碰用户的剪贴板**，而且只在用户点了菜单按钮之后、前两条都拿不到文字时。`/status` 的 `lastResolve.source` 会说清这次用的是哪一条（`uia-prefetch` / `uia-fresh` / `preset` / `clipboard`）。
+- **选区文字 UIA 优先、剪贴板垫底**：点菜单项时才解析选区——先等菜单弹出时就开始的 UIA 预读（一次调用同时拿到**选区**与**段落**），再补读一次（那时无障碍树已热），最后才注入 Ctrl+C 读剪贴板。`/status` 的 `lastResolve.source` 会说清这次用的是哪一条（`uia-prefetch` / `uia-fresh` / `preset` / `clipboard-confirm` / `clipboard`）。**会碰用户剪贴板的地方一共两处**：这里是"点了菜单项之后还读不到文字"，另一处是"UIA 说不出话时用剪贴板核实这次手势选没选中文字"（见上，`DSH_SELECTION_CONFIRM=0` 可关）。
   - 顺带一个观察：Chromium（含 DSH 桌面端自己的 WebView2 窗口）是**被 UIA 问到才打开无障碍树**，刚启动那一下连 TextPattern 都还没有（实测：本轮第一次划词的 3 次尝试全空，之后再问就正常）。所以预读的重试次数比决策窗口长——它在替"点菜单项时"把树焐热；读不到时决策会走"未知 → 照弹"，用户不会因此丢菜单。
 - **注入按键要带扫描码**：`keybd_event` 的 `bScan` 传 0 时，Chromium/WebView2 一类窗口可能不认这次合成按键，剪贴板一动都不动。兜底取词现在用 `MapVirtualKeyW` 补上扫描码，那条路才真的能兜底。
 - **agent 一致性靠复用**：`ctx.agents.create` + `agent.followup` + `agent.whenIdle`，最终文本取自语料权威来源（会话日志里最后一条 `assistant/message`）。
@@ -210,8 +225,10 @@ curl -X POST http://127.0.0.1:3080/api/dsh-selection-tools/system/restart
 
 ## 风险与边界
 
-- **划词本身不碰剪贴板**：选中的文字优先用 UI Automation 读。只有在**点了菜单项之后** UIA 仍读不到时，才会注入一次 Ctrl+C 读剪贴板（随后把原内容写回）——那一次里，用户此刻正按着 Ctrl+C、或期间用户自己复制过，则完全不碰剪贴板；期间别人写的内容不会被当成选区；控制台/终端窗口默认跳过。想要连兜底都不发生，设 `DSH_SELECTION_TEXT_SOURCE=uia`。
-- **UIA 读到的选区可能来自焦点元素**：为了覆盖"浏览器里点上的只是外壳"这类情况，候选链会退到焦点元素的选区。这类"旧选区"不会再让菜单重复弹（按下的地方不在选区里 → `stale-selection`，见上）；真正读不到任何东西时（应用完全不暴露 UIA 文本）仍然照弹——这是"别吞掉这次划词"的取舍，`/status` 的 `lastMenuDecision.reason = unknown` 会说清是这一类。
+- **划词尽量不碰剪贴板**：选中的文字优先用 UI Automation 读。只有在**点了菜单项之后** UIA 仍读不到时，才会注入一次 Ctrl+C 读剪贴板（随后把原内容写回）——那一次里，用户此刻正按着 Ctrl+C、或期间用户自己复制过，则完全不碰剪贴板；期间别人写的内容不会被当成选区；控制台/终端窗口默认跳过。想要连兜底都不发生，设 `DSH_SELECTION_TEXT_SOURCE=uia`。另一处会碰剪贴板的是"UIA 说不出话时用剪贴板核实这次手势"（`DSH_SELECTION_CONFIRM=0` 关掉），它同样受这几条规则约束，并且会把用户原来的文字放回去。
+- **UIA 读到的选区可能来自焦点元素**：为了覆盖"浏览器里点上的只是外壳"这类情况，候选链会退到焦点元素的选区。这类"旧选区"不会再让菜单重复弹（按下的地方不在选区里 → `stale-selection`，见上）；真正读不到任何东西时（应用完全不暴露 UIA 文本）走**剪贴板核实**（见上），核不出结论才退回老行为（`/status` 的 `lastMenuDecision.reason = unknown` 会说清是这一类）。
+- **剪贴板核实的边界**：它靠"注入 Ctrl+C 后有没有复制出文字"来判，所以**在"复制一个不是文字的东西也会产生文字"的场景里不成立**。已知的一种：**WPS/Office 表格里把选中的单元格/区域拖拽搬走**（drag & drop 移动）——松开后单元格仍然是选中的，Ctrl+C 照样能复制出单元格文字，于是这次会被判成"选中了文字"而弹菜单（改动前也是弹的，所以不是回退，只是没修到）。反过来，纯文字选区、双击选词、拖动形状/图片/图表/窗口标题栏这几类都判得对。要彻底区分"选中"和"移动"，需要应用自己暴露选区变化（UIA TextPattern），Qt 版 WPS 不提供。
+- **"这次手势没改动选区"这条判据读不到按下快照时会失效**（`pressProbe` 为空）：那一档退回改动前的行为（照弹），所以拖动已选中元素仍可能偶发弹菜单——按下到松开特别快（`DSH_SELECTION_PRESS_WAIT_MS` 内拍不回来）、应用在按下那一刻不响应 UIA、或者显式关掉了按下探针时。反过来，如果某个应用**在按下时不收起旧选区**、而用户又恰好又拖选了**一模一样的那段文字**，这次划词会被判成 `unchanged-selection` 而不弹；同类的极端情形是"极短又极快的一次拖选"——按下快照拍到的已经是最终那段选区了（`/status` 里能看到它，`DSH_SELECTION_PRESS_PROBE=0` 可临时关掉这条判据）。
 - **只支持 Windows**：Win32 + GDI+ 专用；其它平台退化为页内划词路径。
 - 浮层是**原生自绘**：markdown 支持标题/列表/引用/代码块/粗体/行内码/表格（表格按等宽行排版），不追求浏览器级的排版细节；正文不可选中，复制用面板上的复制按钮。
 - 划词长度上限 12000 字符；超出直接报错，而不是把整篇文档塞给模型。
@@ -245,7 +262,9 @@ curl -X POST http://127.0.0.1:<companionPort>/simulate -H "content-type: applica
 # 2. 点第二行（翻译）：DIP 坐标 (120, 76)
 curl -X POST http://127.0.0.1:<companionPort>/click -H "content-type: application/json" -d '{"x":120,"y":76}'
 # 3. 看状态（是否完成、答案长度、内容高度）；lastCapture 说清上次取词的取舍
-#    （injected / reason / owner / restore），gestures 是手势队列状态
+#    （injected / reason / owner / restore），gestures 是手势队列状态，
+#    pressProbe / recentDecisions[].pressProbe 是"按下那一刻读到的选区"（判"这次手势有没有
+#    选出新东西"的对照面；菜单在拖动已选中元素时冒出来，先看这里）
 curl http://127.0.0.1:<companionPort>/status
 # 4. 抓一张浮层实图（BMP，可用画图/PowerShell 转 PNG）
 # 省略 file 就落到系统临时目录（dsh-selection-overlay.bmp）
@@ -254,12 +273,21 @@ curl -X POST http://127.0.0.1:<companionPort>/capture -H "content-type: applicat
 # 左边中点 → {"zone":"resize-left","code":10}；code 10/11/12/15 = 左/右/上/下，13/14/16/17 = 四个对角
 curl -X POST http://127.0.0.1:<companionPort>/hittest -H "content-type: application/json" -d '{"x":2,"y":240}'
 # 6. 探针：这个屏幕坐标上 UIA 读到了什么、菜单会不会弹（"划不出来"时先问它）
-# decision.reason 的取值：selection（这次手势选出来的）/ stale-selection（上次留下的旧选区）/
-#   no-selection（确实没在选文字）/ shell（落在桌面、任务栏这类系统外壳上）/ unknown（读不到，照弹）/ timeout（宽限期也用完，照弹）
+# decision.reason 的取值：selection（这次手势选出来的）/ unchanged-selection（这次手势没改动
+#   选区，多半在拖动一个已选中的元素）/ stale-selection（上次留下的旧选区）/
+#   no-selection（确实没在选文字）/ shell（落在桌面、任务栏这类系统外壳上）/
+#   unknown 或 timeout（UIA 说不出话，decision.open 为 null）/ clipboard（剪贴板核实到真复制出了
+#   文字）/ unconfirmed（核实过、没复制出文字 → 不弹）/ double-unverified（双击且核不出结论）
 # 想让"元素看点"和"手势按下点"分开（复现"旧选区"那一路）：带上 press
+# 想复现"拖动一个已选中的元素"（unchanged-selection）那一路：带上 pressSelection——它是
+#   "按下那一刻读到的选区"，跟返回的 selection 一样就判为没改动选区（不弹）
+# UIA 判不了（decision.open = null）时，想真的跑一次剪贴板核实用 confirm:true（会注入 Ctrl+C，
+#   仅排障用；不传就只是"待核实"，一个字节都不碰剪贴板）
 # 返回里还有 atGesture（这次手势碰到选区没有）与 rects（选区矩形），一眼看出"为什么没弹"
 curl -X POST http://127.0.0.1:<companionPort>/probe -H "content-type: application/json" -d '{"x":-500,"y":600}'
 curl -X POST http://127.0.0.1:<companionPort>/probe -H "content-type: application/json" -d '{"x":-500,"y":600,"press":{"x":900,"y":700}}'
+curl -X POST http://127.0.0.1:<companionPort>/probe -H "content-type: application/json" -d '{"x":-500,"y":600,"pressSelection":"选中的那段"}'
+curl -X POST http://127.0.0.1:<companionPort>/probe -H "content-type: application/json" -d '{"x":-500,"y":600,"confirm":true}'
 ```
 
 | 路径 | 作用 |

@@ -104,12 +104,24 @@ function delay(ms) {
  *
  * @param api - createWin32() 的产物。
  * @param options - \`restoreClipboard\`（默认 true）、\`checkOwner\`（默认 true）、
- *   \`timeoutMs\`、\`pollMs\`、\`onReport\`（拿一份"这次取词做了什么"的诊断）。
+ *   \`restoreWhenEmpty\`（默认 false，见下）、\`timeoutMs\`、\`pollMs\`、
+ *   \`onReport\`（拿一份"这次取词做了什么"的诊断）。
  * @returns 选中文本；没取到返回 null。
  */
 export async function captureSelection(api, options = {}) {
   const restoreClipboard = options.restoreClipboard !== false
   const checkOwner = options.checkOwner !== false
+  /**
+   * 没取到文字时要不要把用户原来的文字放回去（默认 false = 一个字节都不动）。
+   *
+   * 默认不还原是有原因的：那会儿剪贴板里可能是**别人**刚写的东西（剪贴板管理器、用户自己
+   * 复制），动它就是踩用户。但"用剪贴板核实这次手势选没选中文字"那一路（见 main.mjs 的
+   * confirmByClipboard）不一样：那次 Ctrl+C 是**我们自己**发的，而且非常常见的结局是
+   * "应用把整个形状/图片复制走了，一个文字都没有"——不还原就等于我们白白弄丢了用户原来
+   * 的剪贴板内容。所以这一路显式传 true，判据收紧到：确实观察到写入、那次写入不是别的
+   * 进程写的、之后没人再写过、用户也没在此期间自己复制过。
+   */
+  const restoreWhenEmpty = options.restoreWhenEmpty === true
   const timeoutMs = options.timeoutMs ?? CAPTURE_DEFAULTS.timeoutMs
   const pollMs = options.pollMs ?? CAPTURE_DEFAULTS.pollMs
   const startedAt = Date.now()
@@ -176,7 +188,24 @@ export async function captureSelection(api, options = {}) {
   }
 
   if (text === null) {
-    // 没取到选区时**绝不还原**：此刻剪贴板里是别人（或用户自己）的东西，动它就是踩用户。
+    // 没取到选区时**默认绝不还原**：此刻剪贴板里是别人（或用户自己）的东西，动它就是踩用户。
+    // 唯一的例外是"我们自己的那次注入确实写走了剪贴板、却一个文字都没复制出来"——见
+    // restoreWhenEmpty 的说明。
+    if (restoreWhenEmpty && typeof before === 'string' && before !== '' && report.writes > 0 && !foreignSeen) {
+      if (report.userCopyObserved) {
+        report.restore = 'skip:user-copy'
+      } else if (Number(api.GetClipboardSequenceNumber()) !== lastSeq) {
+        report.restore = 'skip:newer-write'
+      } else {
+        report.restore = 'failed'
+        try {
+          const { writeClipboardText } = await import('./win32.mjs')
+          if (writeClipboardText(api, before) !== false) report.restore = 'restored'
+        } catch {
+          /* 还原失败不影响本次取词 */
+        }
+      }
+    }
     return finish(null, foreignSeen ? 'foreign-write' : 'timeout')
   }
 

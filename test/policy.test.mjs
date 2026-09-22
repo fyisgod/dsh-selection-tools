@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { menuDecision, pickSelection } from '../companion/policy.mjs'
+import { menuDecision, pickSelection, unknownFallback } from '../companion/policy.mjs'
 import { pointNearRects } from '../companion/native/uia.mjs'
 import { createGestureDetector } from '../companion/gesture.mjs'
 
@@ -17,26 +17,23 @@ test('手势落在桌面/任务栏这类系统外壳上：外壳不含可选文�
   assert.deepEqual(menuDecision({ selection: '  ', source: 'shell' }), { open: false, reason: 'shell' })
 })
 
-test('读不到 UIA 文本时照弹：不知道用户选没选，点菜单项还有剪贴板兜底（唯一照弹的未知情形）', () => {
-  assert.deepEqual(menuDecision(null), { open: true, reason: 'unknown' })
-  assert.deepEqual(menuDecision(undefined), { open: true, reason: 'unknown' })
+test('读不到 UIA 文本时不表态（open=null）：UIA 说不出话，交给剪贴板核实', () => {
+  // 办公套件（WPS 的 Qt 版最典型）整个窗口树里没有文档的 TextPattern——UIA 对"选没选中
+  // 文字"完全无话可说。这时不能凭猜弹菜单，也不能凭猜不弹：返回 open=null 让调用方用
+  // 剪贴板核实一次（真选中文字才会复制出文字）。
+  assert.deepEqual(menuDecision(null), { open: null, reason: 'unknown' })
+  assert.deepEqual(menuDecision(undefined), { open: null, reason: 'unknown' })
+  assert.deepEqual(menuDecision(null, '', { kind: 'drag' }), { open: null, reason: 'unknown' })
+  assert.deepEqual(menuDecision(null, '', { kind: 'double' }), { open: null, reason: 'unknown' })
+  // 探针慢（两级预算都用完）也是"没结论"，同样交给核实；诊断理由要保留。
+  assert.deepEqual(menuDecision(null, '', { kind: 'drag', reason: 'timeout' }), { open: null, reason: 'timeout' })
 })
 
-test('双击且探针读不到任何文本元素：不弹（双击图标/列表项/画布/空白处本来就不是划词）', () => {
-  // 实测：/status 的 recentDecisions 里，误弹的双击清一色是 reason=unknown|timeout
-  // 且 probe.state=none（探针什么也没读到）。双击的语义是"选一个词"，读不到任何文本
-  // 元素就说明这一点上多半根本没在选文字。
-  assert.deepEqual(menuDecision(null, '', { kind: 'double' }), { open: false, reason: 'double-unverified' })
-  assert.deepEqual(menuDecision(undefined, '', { kind: 'double' }), { open: false, reason: 'double-unverified' })
-  // 等满两级预算也没等到结论的那一档走同一条判定（探针慢/不可读，不是"读到了空选区"）。
-  assert.deepEqual(menuDecision(null, '', { kind: 'double', reason: 'timeout' }), { open: false, reason: 'double-unverified' })
-})
-
-test('拖选仍然照弹：UIA 读不到文字的窗口里拖拽照样能选出文字，剪贴板兜底还在（这次只收双击）', () => {
-  assert.deepEqual(menuDecision(null, '', { kind: 'drag' }), { open: true, reason: 'unknown' })
-  assert.deepEqual(menuDecision(null, ''), { open: true, reason: 'unknown' })
-  // 拖选那一路的 timeout 诊断不能丢（/status 靠它区分"探针慢"和"探针不可读"）。
-  assert.deepEqual(menuDecision(null, '', { kind: 'drag', reason: 'timeout' }), { open: true, reason: 'timeout' })
+test('核实跑不起来时的兜底 = 改动前的老行为：拖选照弹、双击不弹', () => {
+  // 只有"终端窗口（Ctrl+C 是中断）/ 用户此刻正按着 Ctrl+C / 显式关掉核实"才走这一档。
+  assert.deepEqual(unknownFallback('drag'), { open: true, reason: 'unknown' })
+  assert.deepEqual(unknownFallback(), { open: true, reason: 'unknown' })
+  assert.deepEqual(unknownFallback('double'), { open: false, reason: 'double-unverified' })
 })
 
 test('双击真的选中了文字：必须碰到这次选区才弹', () => {
@@ -95,6 +92,38 @@ test('双击空选区即使命中矩形也不弹；非空同词再次命中仍�
 test('这次手势碰到了这段选区（按下点/松开点在选区里）：弹——这次手势选的就是它', () => {
   assert.deepEqual(menuDecision({ selection: 'Go 调度器', source: 'point', atGesture: true }), { open: true, reason: 'selection' })
   assert.deepEqual(menuDecision({ selection: '  hi ', source: 'focused', atGesture: true }), { open: true, reason: 'selection' })
+})
+
+test('按下时就是这段选区、松开时还是它：这次手势没改动选区，不弹（WPS/Office 里拖动已选中的元素）', () => {
+  // 复现：PPT 里选中一个形状/文本框再拖它、Excel 里拖一个已选中的单元格，UIA 一路都报着
+  // "这个对象被选中"——按下的地方在选区里（atGesture=true），只看松开那一刻就会弹菜单。
+  const probe = { selection: '形状里的文字', source: 'point', atGesture: true }
+  assert.deepEqual(
+    menuDecision(probe, '', { kind: 'drag', pressProbe: { selection: '形状里的文字' } }),
+    { open: false, reason: 'unchanged-selection' },
+  )
+  // 空白差异不算改动（UIA 会把缩进折成空格）：折叠后相同就是同一段。
+  assert.deepEqual(
+    menuDecision(probe, '', { kind: 'drag', pressProbe: { selection: '  形状里的文字 ' } }),
+    { open: false, reason: 'unchanged-selection' },
+  )
+  // 双击一个已经选中的对象（形状/图标）同理：这一串点击没选出任何新东西。
+  assert.deepEqual(
+    menuDecision(probe, '', { kind: 'double', pressProbe: { selection: '形状里的文字' } }),
+    { open: false, reason: 'unchanged-selection' },
+  )
+  // 没拍到快照（老数据/关掉了按下探针/拍得太慢）：少一条判据，照原样弹。
+  assert.deepEqual(menuDecision(probe, '', { kind: 'drag' }), { open: true, reason: 'selection' })
+  assert.deepEqual(menuDecision(probe, '', { kind: 'drag', pressProbe: null }), { open: true, reason: 'selection' })
+  assert.deepEqual(menuDecision(probe, '', { kind: 'drag', pressProbe: { selection: '   ' } }), { open: true, reason: 'selection' })
+})
+
+test('按下时是别的文字（或没有选区）：这次手势确实改动了选区，照弹', () => {
+  const probe = { selection: 'Go 调度器', source: 'point', atGesture: true }
+  // 拖之前这里是空的（按下即把旧选区收成插入符）：这就是一次正常的拖选。
+  assert.deepEqual(menuDecision(probe, '', { kind: 'drag', pressProbe: { selection: '' } }), { open: true, reason: 'selection' })
+  // 拖之前是别的一段：用户重新选了一段。
+  assert.deepEqual(menuDecision(probe, '', { kind: 'drag', pressProbe: { selection: '别的文字' } }), { open: true, reason: 'selection' })
 })
 
 test('几何判定没命中，但文字跟上次菜单那段不一样：照弹（真划词不能被 DPI/字符吸附的噪声杀掉）', () => {

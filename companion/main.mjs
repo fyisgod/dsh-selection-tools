@@ -19,7 +19,7 @@ import { join } from 'node:path'
 
 import { createContextReader } from './context.mjs'
 import { createGestureDetector, createLatestQueue } from './gesture.mjs'
-import { menuDecision, pickSelection } from './policy.mjs'
+import { menuDecision, pickSelection, unknownFallback } from './policy.mjs'
 import { captureSelection, clampSelection } from './selection.mjs'
 import { createGdi } from './native/gdi.mjs'
 import { captureScreenRect } from './native/capture.mjs'
@@ -75,6 +75,35 @@ const MENU_DECIDE_MS = envNumber(process.env.DSH_SELECTION_MENU_DECIDE_MS, 280)
  * 预读在决策窗口超时之后仍会继续跑，所以这些重试主要是在替**点菜单项时**把树焐热。
  */
 const MENU_PROBE_RETRIES = envNumber(process.env.DSH_SELECTION_MENU_PROBE_RETRIES, 3)
+/**
+ * 鼠标**按下**时要不要拍一张"手势之前的选区"快照（`0` 关掉）。
+ *
+ * 它是"这次手势到底有没有选出新东西"的唯一判据：办公套件里拖动一个**已经选中**的元素
+ * （WPS/Office 的 PPT 形状、Excel 单元格）时，UIA 从头到尾都报着"这个对象被选中"——
+ * 只有比较"按下时"和"松开时"读到的选区，才能把"移动元素"和"选文字"分开（见
+ * policy.mjs 的 menuDecision）。代价是每次按下多一次 UIA 读取（在 worker 线程里，不挡
+ * 主进程）；真遇到某个应用在按下时被 UIA 问得很贵，可以把它关掉。
+ */
+const PRESS_PROBE = process.env.DSH_SELECTION_PRESS_PROBE !== '0'
+/**
+ * 等"按下快照"的上限（毫秒）。
+ *
+ * 快照在按下那一刻就发出去了，正常早就回来了（这一步不花时间）；只有"按下到松开特别快"
+ * 的拖拽才会真等——给它一小段时间，免得这种手势直接掉进"没拍到"那一档。再久就不值了：
+ * 划词菜单是手感的一部分，不能为了一条兜底判据把它拖慢。
+ */
+const PRESS_WAIT_MS = envNumber(process.env.DSH_SELECTION_PRESS_WAIT_MS, 120)
+/**
+ * UIA 说不出话时，要不要用**剪贴板**核实一次"这次手势到底选没选中文字"（`0` 关掉）。
+ *
+ * 办公套件（WPS 的 Qt 版最典型）整个窗口树里都没有文档的 TextPattern——UIA 对"有没有选中
+ * 文字"完全无话可说。核实办法是注入一次 Ctrl+C：真选中文字就会复制出文字；拖动一个形状/
+ * 窗口则什么文字都复制不出来。代价是会短暂接管剪贴板（selection.mjs 那几条安全规则照旧：
+ * 终端跳过、用户正在 Ctrl+C 就不注入、只认前台窗口自己写的那次、用完把原内容放回去）。
+ *
+ * 关掉之后退回老行为：拖选照弹、双击不弹（见 policy.mjs 的 unknownFallback）。
+ */
+const CONFIRM_BY_CLIPBOARD = process.env.DSH_SELECTION_CONFIRM !== '0'
 /**
  * 点菜单项时补读 UIA 的重试次数。
  * 那时无障碍树通常已经热了，给 1 次机会挡的是"刚巧还在冷启动"；再多就只是拖延
@@ -141,6 +170,10 @@ const state = {
   recentDecisions: [],
   /** 最近一次 UIA 探针（读到了什么）。 */
   lastProbe: null,
+  /** 最近一次"按下那一刻"的选区快照摘要（判断"这次手势有没有选出新东西"要用它）。 */
+  lastPressProbe: null,
+  /** 最近一次"用剪贴板核实有没有选中文字"的报告（UIA 判不了时才走这一步）。 */
+  lastConfirm: null,
   /** 最近一次"弹不弹菜单"的结论与理由（呼不出来时看这里）。 */
   lastMenuDecision: null,
   /** 最近一次"点菜单项之后用了哪个来源的文字"。 */
@@ -152,6 +185,87 @@ const state = {
 
 /** 手势串行队列（startHook 里建；/status 汇报它的状态）。 */
 let gestureQueue = null
+
+/**
+ * **按下那一刻**读到的选区（"这次手势之前，按住的地方本来就选着什么"）。
+ *
+ * 为什么必须在这一刻拍：拖完再读到的已经是被这次手势改过的选区了，两者一比才知道这次
+ * 手势到底有没有选出新东西——办公套件里拖动一个已选中的元素（PPT 形状、Excel 单元格）时，
+ * 松开那一刻探针照样读到"这个对象被选中"，跟真的拖选文字一模一样（见 policy.mjs 的
+ * menuDecision 第一条判据）。双击第二下不重拍：双击要的是**这一串点击开始之前**的选区。
+ *
+ * `{ at, x, y, pending, result }`；`result` 是探针结果（`undefined` = 还没回来，
+ * `null` = 读不到），/status 的 `pressProbe` 会把它摘出来给人看。
+ */
+let pressSnapshot = null
+
+/**
+ * 有没有一次手势正在等探针结论（`handleGesture` 的决策窗口）。
+ *
+ * 读取器同一时刻只保留最新的一次请求：决策在途时再拍按下快照，会把**这次决策的探针**
+ * 顶掉（结果变成"读不到"→ 拖选照弹），菜单就可能在"随手一拖"时冒出来。所以决策期间不
+ * 拍快照——那一档本来就按"没拍到"处理（少一条判据，回到改动前的行为），代价可忽略。
+ */
+let deciding = false
+
+/**
+ * 拍一张"按下那一刻"的选区快照（`DSH_SELECTION_PRESS_PROBE=0` 可关掉）。
+ *
+ * 一次读取，不重试：它只是给决策多一条判据，拍晚了/读不到都不影响原来的判定（那时按
+ * null 传下去，等于回到改动前的行为）。
+ *
+ * @param press - 手势按下事件（`{ x, y, time, second }`，见 gesture.mjs）。
+ */
+function startPressProbe(press) {
+  if (contextReader === null || !PRESS_PROBE) {
+    pressSnapshot = null
+    return
+  }
+  // 双击的第二下**永远不重拍**：要的是"这一串点击开始之前"的选区——第二下按下时选中的
+  // 词已经出来了，拿它当"拖之前"会把双击选词整个判成"没改动选区"（于是双击再也弹不出来）。
+  if (press.second === true) return
+  // 决策在途时不拍：这一拍会把这次决策的探针顶掉（见 deciding 的说明）。这一下也就没有
+  // 快照了——顺手清掉旧的，免得拿上一次的形状/文字去判这一次手势。
+  if (deciding) {
+    pressSnapshot = null
+    return
+  }
+  const snapshot = {
+    at: Date.now(),
+    x: press.x,
+    y: press.y,
+    /** 探针结果：`undefined` = 还没回来。 */
+    result: undefined,
+    pending: null,
+  }
+  snapshot.pending = contextReader.probe({ x: press.x, y: press.y }, { retries: 0 })
+  pressSnapshot = snapshot
+  void snapshot.pending
+    .then((result) => {
+      snapshot.result = result ?? null
+      state.lastPressProbe = summarizePress(snapshot)
+    })
+    .catch((error) => {
+      snapshot.result = null
+      state.lastPressProbe = summarizePress(snapshot)
+      reportError('press-probe', error)
+    })
+}
+
+/** 按下快照的摘要（/status 与 recentDecisions 用；只截一小段选区文字）。 */
+function summarizePress(snapshot) {
+  if (snapshot === null || snapshot === undefined) return null
+  const result = snapshot.result
+  const selection = typeof result?.selection === 'string' ? result.selection : ''
+  return {
+    at: snapshot.at,
+    state: result === undefined ? 'reading' : result === null ? 'none' : 'ready',
+    source: typeof result?.source === 'string' ? result.source : '',
+    selectionLength: selection.length,
+    /** 缩略（跟 lastMenuSelection 一样只留一小段，够看出"拖的是什么"就行）。 */
+    selection: selection.slice(0, 120),
+  }
+}
 
 /** 上下文读取器（worker 线程；钩子关掉或显式禁用时不建）。 */
 const contextReader = api !== null && gdi !== null && CONTEXT_ENABLED
@@ -612,17 +726,68 @@ async function waitFor(promise, ms) {
  * 结论晚几十毫秒（探针一回来就出菜单），而不是"菜单变慢"。
  *
  * @param previous - 上一次菜单收起时绑的那段文字（见 policy.mjs 的 menuDecision）。
+ * @param pressPending - "按下那一刻"那张快照的在途 promise（可能已经回来了，也可能是 null
+ *   = 没拍/关掉了）；它只用来回答"这次手势有没有选出新东西"。
  * @returns `{ open, reason }`（见 policy.mjs 的 menuDecision）。
  */
-async function decideMenu(pending, budgetMs, previous, kind) {
-  if (contextReader === null || budgetMs <= 0) return menuDecision(null, previous, { kind })
+async function decideMenu(pending, budgetMs, previous, kind, pressPending = null) {
+  // `MENU_DECIDE_MS=0` 是"手势一到就弹、不做任何过滤"的逃生舱：连剪贴板核实都不要走。
+  if (budgetMs <= 0) return unknownFallback(kind)
+  if (contextReader === null) return menuDecision(null, previous, { kind })
+  // 按下快照通常早就回来了（它在按下那一刻就发出去了），这一步几乎不花时间；只给
+  // PRESS_WAIT_MS 这么多宽限——超时就当没拍到（少一条判据，不拦这次划词）。
+  const pressResult = pressPending === null || pressPending === undefined
+    ? null
+    : await waitFor(pressPending, Math.min(budgetMs, PRESS_WAIT_MS))
+  const pressProbe = pressResult === 'timeout' ? null : pressResult
   const first = await waitFor(pending, budgetMs)
-  if (first !== 'timeout') return menuDecision(first, previous, { kind })
+  if (first !== 'timeout') return menuDecision(first, previous, { kind, pressProbe })
   const grace = Math.min(1000, budgetMs * 3)
   const second = await waitFor(pending, grace)
-  // 宽限期也用完：结论仍是"读不到"，照走同一份策略（双击因此不弹；拖选照老行为弹）。
+  // 宽限期也用完：还是读不到 → open 为 null（交给剪贴板核实，见 confirmByClipboard）。
   if (second === 'timeout') return menuDecision(null, previous, { kind, reason: 'timeout' })
-  return menuDecision(second, previous, { kind })
+  return menuDecision(second, previous, { kind, pressProbe })
+}
+
+/**
+ * UIA 判不了（`open: null`）时，用**剪贴板**核实一次"这次手势到底有没有选中文字"。
+ *
+ * 为什么只能靠剪贴板：办公套件（WPS 的 Qt 版最典型）整个窗口树里都没有文档的 TextPattern
+ * ——实测 WPS PPT 的 UIA 树 376 个节点里只有两个功能区长条是文本控件，UIA 对"选没选中
+ * 文字"无话可说。而 Ctrl+C 是**真的会说话**的：真选中文字就会复制出文字；拖动一个形状/
+ * 窗口则什么都复制不出来（这正是"选中元素并拖动也弹菜单"的判别点）。
+ *
+ * 代价与边界都交给 selection.mjs 那几条规则（终端跳过、用户正在按 Ctrl+C 就不注入、只认
+ * 前台窗口自己写的那次、用完把用户原来的文字放回去）；拿不准就**不表态**，由调用方退回
+ * 老行为（见 policy.mjs 的 unknownFallback）。
+ *
+ * 核实成功时顺手把文字记进这次选区：点菜单项时就不用再复制一遍了。
+ *
+ * @param selection - 这次划词的锚点对象（核实成功会写入 `text` / `textSource`）。
+ * @returns `{ state, reason, length }`；state 是 `text`（复制出文字了）/ `none`（没有文字，
+ *   这次手势没在选文字）/ `skipped`（跑不起来：终端、用户正在 Ctrl+C、或显式关掉了核实）。
+ */
+async function confirmByClipboard(selection) {
+  if (!CONFIRM_BY_CLIPBOARD) return { state: 'skipped', reason: 'disabled', length: 0 }
+  const captured = await captureSelection(api, {
+    checkOwner: OWNER_CHECK,
+    // 这次注入是我们自己发的：没复制出文字（典型：把形状/窗口复制走了）时把用户原来的
+    // 文字放回去，免得他们的剪贴板被我们弄丢（见 selection.mjs 的 restoreWhenEmpty）。
+    restoreWhenEmpty: true,
+    onReport: (report) => {
+      state.lastConfirm = report
+    },
+  })
+  const report = state.lastConfirm
+  const reason = typeof report?.reason === 'string' ? report.reason : 'timeout'
+  if (captured !== null && captured.trim() !== '') {
+    const text = clampSelection(captured, MAX_TEXT)
+    selection.text = text
+    selection.textSource = 'clipboard-confirm'
+    return { state: 'text', reason: 'ok', length: text.length }
+  }
+  if (reason === 'terminal' || reason === 'user-copy') return { state: 'skipped', reason, length: 0 }
+  return { state: 'none', reason, length: 0 }
 }
 
 /**
@@ -996,7 +1161,22 @@ async function handleGesture(gesture, isCurrent) {
     pending: null,
   }
   const pending = startProbe(selection)
-  const decision = await decideMenu(pending, MENU_DECIDE_MS, state.lastMenuSelection, gesture.kind)
+  deciding = true
+  let decision
+  let confirm = null
+  try {
+    decision = await decideMenu(pending, MENU_DECIDE_MS, state.lastMenuSelection, gesture.kind, gesture.press?.pending ?? null)
+    if (decision.open === null) {
+      // UIA 说不出话（WPS/Office 的 Qt 版这类不暴露文档文本的应用）：用剪贴板核实一次
+      // "到底有没有选中文字"——真选中了会复制出文字，拖动形状/窗口则什么都复制不出来。
+      confirm = await confirmByClipboard(selection)
+      if (confirm.state === 'text') decision = { open: true, reason: 'clipboard' }
+      else if (confirm.state === 'none') decision = { open: false, reason: 'unconfirmed' }
+      else decision = unknownFallback(gesture.kind)
+    }
+  } finally {
+    deciding = false
+  }
   state.lastMenuDecision = { open: decision.open, reason: decision.reason, kind: gesture.kind, at: Date.now() }
   state.recentDecisions.push({
     at: state.lastMenuDecision.at,
@@ -1008,6 +1188,10 @@ async function handleGesture(gesture, isCurrent) {
     probe: state.lastProbe === null
       ? null
       : { at: state.lastProbe.at, state: state.lastProbe.state, source: state.lastProbe.source, atGesture: state.lastProbe.atGesture ?? null, selectionLength: state.lastProbe.selectionLength ?? 0, className: state.lastProbe.className ?? '' },
+    /** 按下那一刻读到的是什么（判"这次手势有没有选出新东西"的对照面）。 */
+    pressProbe: summarizePress(gesture.press ?? null),
+    /** UIA 判不了时的剪贴板核实结果（null = 这次 UIA 直接给出了结论，没走核实）。 */
+    confirm,
     point: { x: gesture.x, y: gesture.y },
     press: { x: gesture.downX, y: gesture.downY },
   })
@@ -1032,8 +1216,13 @@ function startHook() {
     onError: (error) => reportError('gesture', error),
   })
   const detector = createGestureDetector({
+    // 按下的那一刻拍一张"手势之前的选区"：只有它能把"拖动一个已选中的元素"和"拖选文字"
+    // 分开（见 startPressProbe 与 policy.mjs 的 menuDecision）。
+    onPress: (press) => startPressProbe(press),
     onGesture: (gesture) => {
-      gestureQueue.submit(gesture)
+      // 快照跟着手势一起进队列：等待期间用户又按了一下的话，这次手势要用的仍是**它自己
+      // 按下时**拍的那张，而不是更新鲜的那张。
+      gestureQueue.submit({ ...gesture, press: pressSnapshot })
     },
   })
   const buttons = { left: false, right: false, middle: false }
@@ -1103,6 +1292,10 @@ const server = createServer((req, res) => {
       lastGesture: state.lastGesture,
       /** 最近一次 UIA 探针读到了什么（菜单呼不出来时先看这里）。 */
       lastProbe: state.lastProbe,
+      /** 最近一次"按下那一刻"的选区快照（"这次手势有没有选出新东西"的对照面）。 */
+      pressProbe: state.lastPressProbe,
+      /** 最近一次"用剪贴板核实有没有选中文字"的报告（UIA 判不了时才走这一步）。 */
+      lastConfirm: state.lastConfirm,
       /** 最近一次"弹不弹菜单"的结论与理由。 */
       lastMenuDecision: state.lastMenuDecision,
       /** 最近一次点菜单项之后，用的是哪个来源的文字。 */
@@ -1178,9 +1371,23 @@ const server = createServer((req, res) => {
           ? { x: Number(body.press.x ?? point.x), y: Number(body.press.y ?? point.y) }
           : point
         const result = await contextReader.probe(point, { retries, press })
+        // 按下那一刻读到的是什么：`pressSelection` 显式给（不带就是"没拍到"那一档），
+        // 用来复现"拖动一个已选中的元素"（unchanged-selection）与"真的拖选了文字"这两路。
+        const pressProbe = typeof body.pressSelection === 'string' ? { selection: body.pressSelection } : null
+        const provisional = menuDecision(result, '', { kind: typeof body.kind === 'string' ? body.kind : '', pressProbe })
+        // `confirm: true` → UIA 判不了时**真的**跑一次剪贴板核实（会注入 Ctrl+C，仅排障用）；
+        // 不传的话 open 为 null 只是"待核实"，不会碰剪贴板。
+        const confirm = body.confirm === true && provisional.open === null ? await confirmByClipboard({}) : null
+        const decision = confirm === null
+          ? provisional
+          : confirm.state === 'text'
+            ? { open: true, reason: 'clipboard' }
+            : confirm.state === 'none'
+              ? { open: false, reason: 'unconfirmed' }
+              : unknownFallback(typeof body.kind === 'string' ? body.kind : '')
         respondJson(res, 200, {
           ok: true,
-          decision: menuDecision(result, '', { kind: typeof body.kind === 'string' ? body.kind : '' }),
+          decision,
           selection: result === null ? '' : result.selection,
           context: result === null ? '' : result.text,
           source: result === null ? '' : result.source,
@@ -1188,6 +1395,8 @@ const server = createServer((req, res) => {
           /** 选区矩形（诊断用：看"为什么没弹"时对照着手势落点）。 */
           rects: result === null ? null : (result.rects ?? null),
           className: result === null ? '' : result.className,
+          pressProbe,
+          confirm,
           stats: contextReader.stats(),
         })
       } catch (error) {

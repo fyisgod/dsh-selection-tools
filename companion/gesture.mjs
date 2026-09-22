@@ -9,6 +9,12 @@
  * 后者用来回答"这一次拖拽/双击到底选没选出文字"——旧选区还留在应用里的时候，光凭松开
  * 的位置分不出"这次真选了"和"上次留下的"（见 companion/policy.mjs 的 menuDecision）。
  *
+ * 除了手势本身，还会在**鼠标按下的那一刻**回调一次 \`onPress\`：那是唯一能拍到"这次手势
+ * 之前这块地方本来就选着什么"的时刻（拖完再读到的已经是被这次手势改过的选区了）。带上
+ * \`second\` 是为了让调用方知道这一下是"双击的第二下"——双击要的是**这一串点击开始之前**
+ * 的选区，所以第二下不该重拍快照（见 companion/policy.mjs 的 menuDecision 与
+ * companion/main.mjs 的 startPressProbe）。
+ *
  * 采样由调用方（companion/main.mjs）以固定频率喂进来，因此这里完全不依赖
  * 钩子/回调，测试可以直接喂一串假采样。
  */
@@ -25,12 +31,13 @@ export const GESTURE_DEFAULTS = {
 
 /**
  * 创建手势检测器。
- * @param options - 阈值覆盖 + \`onGesture\` 回调。
+ * @param options - 阈值覆盖 + \`onGesture\` / \`onPress\` 回调。
  * @returns \`{ push }\`。
  */
 export function createGestureDetector(options = {}) {
   const config = { ...GESTURE_DEFAULTS, ...options }
   const onGesture = options.onGesture ?? (() => {})
+  const onPress = options.onPress ?? (() => {})
 
   let pressed = false
   let downX = 0
@@ -56,6 +63,8 @@ export function createGestureDetector(options = {}) {
         awaitingSecondClick =
           time - lastUpTime <= config.doubleClickMs &&
           Math.hypot(x - lastUpX, y - lastUpY) <= config.doubleClickSlop
+        // 按下的这一刻回调：调用方要在这里拍一张"手势之前的选区"快照（见文件头）。
+        onPress({ x, y, time, second: awaitingSecondClick })
       } else {
         moved = Math.max(moved, Math.hypot(x - downX, y - downY))
       }

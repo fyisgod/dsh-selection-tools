@@ -303,3 +303,49 @@ test('诊断报告说清楚这次取词做了什么（注入/属主/还原的取
     fake.stop()
   }
 })
+
+test('核实路径：注入的 Ctrl+C 一个字都没复制出来（形状/窗口被复制走了）→ 把用户原来的内容放回去', async () => {
+  // 这一路是"用剪贴板核实这次手势选没选中文字"（UIA 在 WPS 这类应用里说不出话）。
+  // 很常见的结局是"应用把整个形状/图片复制走了，一个文字都没有"——那次复制是我们自己
+  // 注入的，不能让它偷走用户原来的剪贴板内容。
+  const fake = fakeWin32({ selection: '', copyOwner: 0 })
+  try {
+    const reports = []
+    const text = await captureSelection(fake.api, {
+      timeoutMs: 80, pollMs: 5, restoreWhenEmpty: true, onReport: (r) => reports.push(r),
+    })
+    assert.equal(text, null, '没有文字 = 这次手势没在选文字')
+    assert.equal(reports[0].writes, 1, '确实观察到一次写入（我们的注入生效了）')
+    assert.equal(reports[0].restore, 'restored')
+    assert.equal(fake.chip.text, '旧剪贴板内容', '我们自己那次复制不能把用户的剪贴板弄丢')
+  } finally {
+    fake.stop()
+  }
+})
+
+test('核实路径：默认（不传 restoreWhenEmpty）没取到文字时仍然一个字节都不动', async () => {
+  const fake = fakeWin32({ selection: '', copyOwner: 0 })
+  try {
+    const reports = []
+    await captureSelection(fake.api, { timeoutMs: 80, pollMs: 5, onReport: (r) => reports.push(r) })
+    assert.equal(reports[0].restore, 'none')
+    assert.equal(fake.chip.text, '', '默认不还原：没有把握时绝不碰剪贴板')
+  } finally {
+    fake.stop()
+  }
+})
+
+test('核实路径：确认那次写入是别的进程写的 → 不还原（别人刚写的东西不能踩）', async () => {
+  const fake = fakeWin32({ selection: '', copyOwner: 200 })
+  try {
+    const reports = []
+    const text = await captureSelection(fake.api, {
+      timeoutMs: 80, pollMs: 5, restoreWhenEmpty: true, onReport: (r) => reports.push(r),
+    })
+    assert.equal(text, null)
+    assert.equal(reports[0].reason, 'foreign-write')
+    assert.equal(reports[0].restore, 'none')
+  } finally {
+    fake.stop()
+  }
+})
