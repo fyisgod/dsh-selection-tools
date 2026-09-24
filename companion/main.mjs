@@ -774,6 +774,7 @@ async function confirmByClipboard(selection) {
     // 这次注入是我们自己发的：没复制出文字（典型：把形状/窗口复制走了）时把用户原来的
     // 文字放回去，免得他们的剪贴板被我们弄丢（见 selection.mjs 的 restoreWhenEmpty）。
     restoreWhenEmpty: true,
+    textOnly: true,
     onReport: (report) => {
       state.lastConfirm = report
     },
@@ -784,10 +785,10 @@ async function confirmByClipboard(selection) {
     const text = clampSelection(captured, MAX_TEXT)
     selection.text = text
     selection.textSource = 'clipboard-confirm'
-    return { state: 'text', reason: 'ok', length: text.length }
+    return { state: 'text', reason: 'ok', length: text.length, formats: report?.formats ?? [] }
   }
   if (reason === 'terminal' || reason === 'user-copy') return { state: 'skipped', reason, length: 0 }
-  return { state: 'none', reason, length: 0 }
+  return { state: 'none', reason, length: 0, formats: report?.formats ?? [], editor: report?.editor ?? null }
 }
 
 /**

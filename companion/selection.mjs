@@ -20,10 +20,14 @@
  *    用户在我们取词期间自己复制了东西，还原就变成"把用户刚复制的内容踩掉"——表现正是
  *    "按了 Ctrl+C 却粘贴出旧内容"。
  */
+import { win32 as path } from 'node:path'
 import {
   WIN,
   clipboardOwnerWindow,
+  clipboardFormats,
+  foregroundEditor,
   keyDown,
+  processImage,
   readClipboardText,
   rootWindow,
   sendCopyShortcut,
@@ -91,6 +95,16 @@ export function ownerRelation(api, foreground) {
   const ownerRootPid = ownerRoot === null ? 0 : windowPid(api, ownerRoot)
   const foregroundRootPid = foregroundRoot === null ? 0 : windowPid(api, foregroundRoot)
   if (ownerRootPid > 0 && ownerRootPid === foregroundRootPid) return 'same-window-tree'
+  // WPS 把文档引擎放在**独立进程**里，而且复制时用的是它自己一个无属主、隐藏的
+  // CLIPBRDWNDCLASS 窗口——两个进程都不是前台窗口那一棵窗口树。只认这一种例外：
+  // 前后台都是同一套 WPS 安装目录下的文档进程（wps/et/wpp），别的兄弟进程一律不认。
+  if (windowClass(api, owner) === 'CLIPBRDWNDCLASS') {
+    const app = processImage(api, foregroundPid).toLowerCase()
+    const writer = processImage(api, ownerPid).toLowerCase()
+    const engines = new Set(['wps.exe', 'et.exe', 'wpp.exe'])
+    if (app && writer && engines.has(path.basename(app)) && engines.has(path.basename(writer))
+      && path.dirname(app) === path.dirname(writer)) return 'wps-document-process'
+  }
   return 'foreign'
 }
 
@@ -151,6 +165,14 @@ export async function captureSelection(api, options = {}) {
   }
 
   const foreground = api.GetForegroundWindow()
+  report.foregroundPid = windowPid(api, foreground)
+  report.foregroundClass = windowClass(api, foreground)
+  if (options.textOnly === true) {
+    report.editor = foregroundEditor(api)
+    // 表格里的选区不是"文字编辑"，先在注入 Ctrl+C **之前**就挡掉：这一下会真的触发
+    // 一次复制，还会把 WPS/Excel 的复制模式搅乱（网格控件是 EXCEL7，编辑框是 EXCEL6/_WwG）。
+    if (report.foregroundClass === 'XLMAIN' && report.editor?.focusClass === 'EXCEL7') return finish(null, 'not-text-editing')
+  }
   if (isTerminalWindow(api, foreground)) return finish(null, 'terminal')
   // 规则 1：用户正在按 Ctrl+C，这次取词直接放弃——不注入、不还原、一个字节都不动。
   if (userCopyPending(api)) return finish(null, 'user-copy')
@@ -164,6 +186,7 @@ export async function captureSelection(api, options = {}) {
   let text = null
   let textSeq = null
   let foreignSeen = false
+  let nonTextSelection = false
   let lastSeq = beforeSeq
   while (Date.now() < deadline) {
     await delay(pollMs)
@@ -174,9 +197,22 @@ export async function captureSelection(api, options = {}) {
     report.writes += 1
     // 规则 2：确定是别的进程写的那次就不要，继续等（真正那次复制通常紧跟其后）。
     const relation = checkOwner ? ownerRelation(api, foreground) : 'ours'
+    report.owner = relation
+    const owner = clipboardOwnerWindow(api)
+    report.ownerPid = owner == null ? 0 : windowPid(api, owner)
+    report.ownerClass = owner == null ? '' : windowClass(api, owner)
     if (relation === 'foreign') {
       foreignSeen = true
       continue
+    }
+    report.formats = options.textOnly === true ? clipboardFormats(api) : []
+    if (Number(api.GetClipboardSequenceNumber()) !== seq) continue
+    // 单元格区域和嵌入对象**也会**在剪贴板里挂一份纯文本，光看"复制出文字了没有"
+    // 分不开。改用剪贴板自己的**原生对象格式**当证据：只有 HTML/RTF 是正常的富文本。
+    if (options.textOnly === true && report.formats.some((format) =>
+      /^(?:WPS Spreadsheets .* Format|XML Spreadsheet|Biff\d*)$/i.test(format))) {
+      nonTextSelection = true
+      break
     }
     const captured = readClipboardText(api)
     if (typeof captured === 'string' && captured.trim() !== '') {
@@ -206,7 +242,7 @@ export async function captureSelection(api, options = {}) {
         }
       }
     }
-    return finish(null, foreignSeen ? 'foreign-write' : 'timeout')
+    return finish(null, nonTextSelection ? 'non-text-selection' : foreignSeen ? 'foreign-write' : 'timeout')
   }
 
   // 规则 3：还原只在"我们读完之后没人再写过剪贴板"时才做。

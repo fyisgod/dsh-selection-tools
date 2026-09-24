@@ -19,9 +19,9 @@ function fold(text) {
  * 剪贴板，就得自己回答老实现靠剪贴板回答的问题：**这一次拖拽/双击到底是不是在选文字**。
  * 用 UIA 的文本模式回答：
  *
- * - 没有选区（元素带 TextPattern 却报不出任何选区——点上的元素是这样，焦点元素也是
- *   这样）、或者手势落在桌面/任务栏这类不含可选文本的系统外壳上 → **不弹**：拖窗口、
- *   拖滑块、拖桌面、双击图标都不该弹；
+ * - 手势落在桌面/任务栏这类不含可选文本的系统外壳上 → **不弹**。普通元素带 TextPattern
+ *   却报不出选区时不能直接下结论：WPS 可能只命中功能区控件，交给剪贴板确认；拖窗口、
+ *   拖滑块、拖桌面、双击图标最终仍因复制不到文字而不弹；
  * - **按下时读到的就是这一段、松开时还是它** → **不弹**（`unchanged-selection`）：这次手势
  *   压根没改动选区，也就没"选出"任何东西。办公套件里最典型：WPS/Office 的 PPT 里选中一个
  *   形状/文本框再拖动它、Excel 里拖一个已选中的单元格/图表，UIA 一路都报着"这个对象被选中"
@@ -37,8 +37,9 @@ function fold(text) {
  *   应用里的旧选区，菜单已经为它弹过、也已经收起。少了这条，用户在菜单收起后随便一拖，
  *   探针照样读到那段旧文字，菜单就"再也甩不掉"。
  *
- * 只有"什么都没读到"（应用不暴露 UIA 文本、读超时）才算**判不了**，这种情况一律返回
- * `open: null`，由调用方核实（见 companion/main.mjs 的 confirmSelectionByClipboard）：
+ * 只有"什么都没读到"（应用不暴露 UIA 文本、读超时），或者普通 UIA 文本控件没有选区，
+ * 才算**判不了**，这种情况一律返回 `open: null`，由调用方核实（见 companion/main.mjs
+ * 的 confirmByClipboard）：
  *
  * - **办公套件（WPS/Office 的 Qt 版）就是这一类**：整个窗口树里没有文档的 TextPattern
  *   （实测 WPS PPT 的 UIA 树 376 个节点里只有两个功能区长条是文本控件），UIA 对"选没选中
@@ -63,10 +64,11 @@ function fold(text) {
  * @returns `{ open, reason }`；open 是 true（弹）/ false（不弹）/**null（UIA 判不了，去核实）**。
  *   reason 只用于诊断（/status 里能看到为什么没弹）：
  *   selection（这次手势选出来的）/ unchanged-selection（这次手势没改动选区，多半在拖动一个
- *   已选中的元素）/ stale-selection（上次留下的旧选区）/
- *   no-selection（确实没在选文字）/ shell（落在桌面/任务栏这类系统外壳上）/
- *   unknown 或 timeout（UIA 判不了，open=null）/ clipboard（剪贴板核实到"真复制出了文字"）/
- *   unconfirmed（核实过，没复制出文字 → 不弹）/ double-unverified（双击且核不出结论，不弹）。
+ *   已选中的元素）/ stale-selection（上次留下的旧选区）/ double-not-at-gesture（双击，读到的
+ *   选区不在这次手势上）/ shell（落在桌面/任务栏这类系统外壳上）/
+ *   unknown 或 timeout（UIA 判不了，open=null，交给剪贴板核实）/ clipboard（剪贴板核实到
+ *   "真复制出了文字"）/ unconfirmed（核实过，没复制出文字 → 不弹）/
+ *   double-unverified（双击且核不出结论，不弹）。
  */
 export function menuDecision(probe, previous, options = {}) {
   if (probe === null || probe === undefined) {
@@ -77,7 +79,10 @@ export function menuDecision(probe, previous, options = {}) {
   if (selected === '') {
     // 手势落在桌面/任务栏这类系统外壳上：外壳不含可选文本，也是"确实没在选文字"。
     if (probe.source === 'shell') return { open: false, reason: 'shell' }
-    return { open: false, reason: 'no-selection' }
+    // 普通元素带 TextPattern 却报不出选区：**不能**就此认定"没在选文字"——WPS/Office
+    // 的探针可能只命中一个跟文档无关的文本控件（比如功能区），那里本来就没有选区。
+    // 这一档同样**不表态**，交给剪贴板核实去区分"真选中了文字"和"在拖对象/窗口"。
+    return { open: null, reason: 'unknown' }
   }
   // 0) 按下时就是这一段、松开时还是它：这次手势没改动选区——用户多半在**拖动一个已经
   //    选中的元素**（WPS/Office 的 PPT 形状、文本框，Excel 的单元格/图表），而不是在选

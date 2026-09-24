@@ -2,7 +2,7 @@
  * 划词策略单测：菜单该不该弹、这一次用哪段文字。
  *
  * 这两条判断是「菜单呼不出来」和「回答的不是我选的那段」两个老问题的分水岭，
- * 所以每条分支都钉住——反证过：把 \`menuDecision\` 的 no-selection 分支改成一律弹，
+ * 所以每条分支都钉住——反证过：把 \`menuDecision\` 里"空选区"那一档改成一律弹，
  * 「拖窗口也弹菜单」的用例立刻红。
  */
 import assert from 'node:assert/strict'
@@ -82,9 +82,9 @@ test('鼠标双击采样传入策略：读到其他位置文字时不会发出�
   }
 })
 
-test('双击空选区即使命中矩形也不弹；非空同词再次命中仍能弹', () => {
+test('双击空选区交给剪贴板确认；非空同词再次命中仍能弹', () => {
   for (const selection of ['', '   ', '\n']) {
-    assert.equal(menuDecision({ selection, atGesture: true }, '', { kind: 'double' }).open, false)
+    assert.equal(menuDecision({ selection, atGesture: true }, '', { kind: 'double' }).open, null)
   }
   assert.equal(menuDecision({ selection: '同词', atGesture: true }, '同词', { kind: 'double' }).open, true)
 })
@@ -140,19 +140,19 @@ test('同一段文字 + 手势没碰到它：这是上次留下的旧选区，�
   assert.deepEqual(menuDecision({ selection: 'Go 调度器', source: 'point', atGesture: false }, ' Go  调度器 '), { open: false, reason: 'stale-selection' })
 })
 
-test('点上元素带 TextPattern 却没有选区：这是「没在选文字」，不弹（拖窗口/拖滑块/双击图标都不该弹）', () => {
-  assert.deepEqual(menuDecision({ selection: '', source: 'point' }), { open: false, reason: 'no-selection' })
-  assert.deepEqual(menuDecision({ selection: '   ', source: 'point' }), { open: false, reason: 'no-selection' })
+test('普通 UIA 元素没有选区：交给剪贴板确认', () => {
+  assert.deepEqual(menuDecision({ selection: '', source: 'point' }), { open: null, reason: 'unknown' })
+  assert.deepEqual(menuDecision({ selection: '   ', source: 'point' }), { open: null, reason: 'unknown' })
 })
 
-test('焦点元素带 TextPattern 却报不出选区：确实没在选文字，不弹（拖桌面、拖窗口都不该弹）', () => {
-  assert.deepEqual(menuDecision({ selection: '', source: 'focused' }), { open: false, reason: 'no-selection' })
+test('焦点元素带 TextPattern 却报不出选区：交给剪贴板确认', () => {
+  assert.deepEqual(menuDecision({ selection: '', source: 'focused' }), { open: null, reason: 'unknown' })
 })
 
-test('选区字段缺失/不是字符串时按「没有选区」算，不抛错', () => {
-  assert.deepEqual(menuDecision({ source: 'point' }), { open: false, reason: 'no-selection' })
-  assert.deepEqual(menuDecision({ selection: null, source: 'point' }), { open: false, reason: 'no-selection' })
-  assert.deepEqual(menuDecision({}), { open: false, reason: 'no-selection' })
+test('选区字段缺失/不是字符串时交给剪贴板确认，不抛错', () => {
+  assert.deepEqual(menuDecision({ source: 'point' }), { open: null, reason: 'unknown' })
+  assert.deepEqual(menuDecision({ selection: null, source: 'point' }), { open: null, reason: 'unknown' })
+  assert.deepEqual(menuDecision({}), { open: null, reason: 'unknown' })
 })
 
 test('几何判定：点在选区矩形里就算碰到；不在里面要看余量', () => {

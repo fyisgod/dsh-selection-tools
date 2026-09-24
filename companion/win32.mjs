@@ -85,6 +85,11 @@ export function createWin32(hints = []) {
 
   const POINT = koffi.struct('DST_POINT', { x: 'long', y: 'long' })
   const RECT = koffi.struct('DST_RECT', { left: 'long', top: 'long', right: 'long', bottom: 'long' })
+  const GUITHREADINFO = koffi.struct('DST_GUITHREADINFO', {
+    cbSize: 'uint32', flags: 'uint32', hwndActive: 'void *', hwndFocus: 'void *',
+    hwndCapture: 'void *', hwndMenuOwner: 'void *', hwndMoveSize: 'void *',
+    hwndCaret: 'void *', rcCaret: RECT,
+  })
   const MONITORINFO = koffi.struct('DST_MONITORINFO', {
     cbSize: 'uint32',
     rcMonitor: RECT,
@@ -135,6 +140,8 @@ export function createWin32(hints = []) {
   api.GetCursorPos = user32.func('bool GetCursorPos(_Out_ DST_POINT *pt)')
   api.GetAsyncKeyState = user32.func('short GetAsyncKeyState(int vKey)')
   api.GetForegroundWindow = user32.func('void *GetForegroundWindow()')
+  api.GetGUIThreadInfo = user32.func('bool GetGUIThreadInfo(uint32 thread, _Inout_ DST_GUITHREADINFO *info)')
+  api.sizeofGuiThreadInfo = koffi.sizeof(GUITHREADINFO)
   api.GetWindowTextW = user32.func('int GetWindowTextW(void *hWnd, _Out_ uint16_t *lpString, int nMaxCount)')
   api.GetClassNameW = user32.func('int GetClassNameW(void *hWnd, _Out_ uint16_t *lpString, int nMaxCount)')
   api.GetWindowRect = user32.func('bool GetWindowRect(void *hWnd, _Out_ DST_RECT *rect)')
@@ -176,6 +183,11 @@ export function createWin32(hints = []) {
   api.GetClipboardSequenceNumber = user32.func('unsigned long GetClipboardSequenceNumber()')
   // 剪贴板属主窗口：用来判断"这次写入是不是前台应用自己干的"（取词只认它）。
   api.GetClipboardOwner = user32.func('void *GetClipboardOwner()')
+  api.EnumClipboardFormats = user32.func('unsigned int EnumClipboardFormats(unsigned int format)')
+  api.GetClipboardFormatNameW = user32.func('int GetClipboardFormatNameW(unsigned int format, _Out_ uint16_t *name, int size)')
+  api.OpenProcess = kernel32.func('void *OpenProcess(uint32 access, bool inherit, uint32 pid)')
+  api.QueryFullProcessImageNameW = kernel32.func('bool QueryFullProcessImageNameW(void *process, uint32 flags, _Out_ uint16_t *name, _Inout_ uint32 *size)')
+  api.CloseHandle = kernel32.func('bool CloseHandle(void *handle)')
   // 顶层祖先窗口：UWP 这类应用里，前台是框架窗口（ApplicationFrameHost），真正处理
   // Ctrl+C 的窗口是它的子窗口、属于另一个进程——按"根窗口的进程"能把它们认成一家。
   api.GetAncestor = user32.func('void *GetAncestor(void *hwnd, unsigned int gaFlags)')
@@ -196,6 +208,46 @@ export function createWin32(hints = []) {
     api.DwmSetWindowAttribute = dwmapi.func('int DwmSetWindowAttribute(void *hwnd, unsigned int attribute, void *pvAttribute, unsigned int cbAttribute)')
   }
   return api
+}
+
+/** 前台线程的焦点控件与光标控件（用来区分"表格网格"和"文字编辑框"）。 */
+export function foregroundEditor(api) {
+  if (typeof api.GetGUIThreadInfo !== 'function') return null
+  const info = { cbSize: api.sizeofGuiThreadInfo }
+  if (!api.GetGUIThreadInfo(0, info)) return null
+  return { focusClass: windowClass(api, info.hwndFocus), caretClass: windowClass(api, info.hwndCaret),
+    caret: info.hwndCaret != null && info.hwndCaret !== 0, flags: Number(info.flags) }
+}
+
+/** 只枚举剪贴板里的格式名，不读任何格式的载荷。 */
+export function clipboardFormats(api) {
+  if (typeof api.EnumClipboardFormats !== 'function' || !api.OpenClipboard(null)) return []
+  try {
+    const formats = []
+    for (let id = api.EnumClipboardFormats(0); id; id = api.EnumClipboardFormats(id)) {
+      const buffer = new Uint16Array(256)
+      const length = api.GetClipboardFormatNameW(id, buffer, buffer.length)
+      formats.push(length > 0 ? String.fromCharCode(...buffer.subarray(0, length)) : String(id))
+    }
+    return formats
+  } finally {
+    api.CloseClipboard()
+  }
+}
+
+/** 只查可执行文件路径，绝不碰命令行。 */
+export function processImage(api, pid) {
+  if (!(pid > 0) || typeof api.OpenProcess !== 'function') return ''
+  const handle = api.OpenProcess(0x1000, false, pid)
+  if (handle === null) return ''
+  try {
+    const buffer = new Uint16Array(32768)
+    const size = [buffer.length]
+    if (!api.QueryFullProcessImageNameW(handle, 0, buffer, size)) return ''
+    return String.fromCharCode(...buffer.subarray(0, size[0]))
+  } finally {
+    api.CloseHandle(handle)
+  }
 }
 
 /** 常量（避免业务代码里出现魔数）。 */

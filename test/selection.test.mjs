@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { captureSelection } from '../companion/selection.mjs'
+import { captureSelection, ownerRelation } from '../companion/selection.mjs'
 import { WIN } from '../companion/win32.mjs'
 
 /**
@@ -44,6 +44,18 @@ function fakeWin32(config = {}) {
   }
 
   const api = {
+    OpenProcess: (_access, _inherit, pid) => config.images?.[pid] ? pid : null,
+    QueryFullProcessImageNameW: (pid, _flags, buffer, size) => {
+      const image = config.images[pid]
+      for (let i = 0; i < image.length; i += 1) buffer[i] = image.charCodeAt(i)
+      size[0] = image.length
+      return true
+    },
+    CloseHandle: () => true,
+    GetGUIThreadInfo: (_thread, info) => {
+      Object.assign(info, { hwndFocus: config.focusHwnd ?? APP, hwndCaret: config.caret ? APP : null, flags: 0 })
+      return true
+    },
     // koffi 只被 readClipboardText 用来把指针解成字符串；这里直接回假剪贴板的内容。
     koffi: {
       decode: () => chip.text ?? '',
@@ -67,6 +79,15 @@ function fakeWin32(config = {}) {
     },
     GetClipboardSequenceNumber: () => chip.seq,
     GetClipboardOwner: () => chip.owner,
+    EnumClipboardFormats: (id) => {
+      const index = id === 0 ? 0 : id - 49152 + 1
+      return index < (config.formats ?? []).length ? 49152 + index : 0
+    },
+    GetClipboardFormatNameW: (id, buffer) => {
+      const name = config.formats[id - 49152]
+      for (let i = 0; i < name.length; i += 1) buffer[i] = name.charCodeAt(i)
+      return name.length
+    },
     GetAsyncKeyState: (vk) => (keys.has(vk) ? -32768 : 0),
     keybd_event: (vk, _scan, flags) => {
       if (vk !== WIN.VK_C || (Number(flags) & WIN.KEYEVENTF_KEYUP) === 0) return
@@ -142,6 +163,87 @@ function fakeWin32(config = {}) {
     },
   }
 }
+
+test('剪贴板核实：即使剪贴板里挂着纯文本，单元格区域和嵌入对象也一律不算选中文字', async () => {
+  for (const format of ['WPS Spreadsheets 6.0 Format', 'XML Spreadsheet', 'Biff8']) {
+    const fake = fakeWin32({ formats: ['HTML Format', format] })
+    try {
+      const reports = []
+      assert.equal(await captureSelection(fake.api, { textOnly: true, restoreWhenEmpty: true, timeoutMs: 200, pollMs: 5, onReport: (r) => reports.push(r) }), null)
+      assert.equal(reports[0].reason, 'non-text-selection')
+      assert.equal(fake.chip.text, '旧剪贴板内容')
+    } finally {
+      fake.stop()
+    }
+  }
+})
+
+test('剪贴板核实：纯文本与富文本都算数，多行选区也照读', async () => {
+  for (const formats of [[], ['DataObject', 'Ole Private Data'], ['HTML Format', 'Rich Text Format'], ['Kingsoft WPS 9.0 Format', 'Embed Source', 'Kingsoft Shapes Tag', 'Rich Text Format']]) {
+    const fake = fakeWin32({ formats, selection: 'first\tline\nsecond line' })
+    try {
+      assert.equal(await captureSelection(fake.api, { textOnly: true, timeoutMs: 200, pollMs: 5 }), 'first\tline\nsecond line')
+    } finally {
+      fake.stop()
+    }
+  }
+})
+
+test('WPS 表格网格一个字节都不注入；没有 Win32 光标时编辑框与 Word 照样算数', async () => {
+  for (const [className, focusClass, eligible] of [
+    ['XLMAIN', 'EXCEL7', false],
+    ['XLMAIN', 'EXCEL6', true],
+    ['XLMAIN', '_WwG', true],
+  ]) {
+    const fake = fakeWin32({ className, focusHwnd: 302, extraWindows: [[302, { pid: 500, root: 100, className: focusClass }]] })
+    try {
+      const reports = []
+      const text = await captureSelection(fake.api, { textOnly: true, timeoutMs: 200, pollMs: 5, onReport: (r) => reports.push(r) })
+      assert.equal(text, eligible ? '选中的文字' : null)
+      assert.equal(fake.log.injections, eligible ? 1 : 0)
+      if (!eligible) {
+        assert.equal(reports[0].reason, 'not-text-editing')
+        assert.equal(fake.chip.seq, 1)
+      }
+    } finally {
+      fake.stop()
+    }
+  }
+})
+
+test('WPS 文档进程写的剪贴板照认，但"别人写的不要"这条保护没被关掉', async () => {
+  const fake = fakeWin32({
+    copyOwner: 301,
+    images: { 500: 'E:\\WPS\\office6\\wps.exe', 700: 'E:\\WPS\\office6\\et.exe' },
+    extraWindows: [[301, { pid: 700, root: 301, className: 'CLIPBRDWNDCLASS' }]],
+  })
+  try {
+    const reports = []
+    assert.equal(await captureSelection(fake.api, { timeoutMs: 200, pollMs: 5, onReport: (r) => reports.push(r) }), '选中的文字')
+    assert.equal(reports[0].owner, 'wps-document-process')
+    assert.equal(reports[0].ownerPid, 700)
+    assert.equal(fake.chip.text, '旧剪贴板内容')
+  } finally {
+    fake.stop()
+  }
+})
+
+test('WPS 这个例外只认同一套安装：别的安装目录、认不出的进程、无关的剪贴板窗口都不算', () => {
+  for (const [image, className] of [
+    ['D:\\Other\\wps.exe', 'CLIPBRDWNDCLASS'],
+    ['E:\\WPS\\office6\\clipboard.exe', 'CLIPBRDWNDCLASS'],
+    ['E:\\WPS\\office6\\wps.exe', 'OtherApp'],
+    ['', 'CLIPBRDWNDCLASS'],
+  ]) {
+    const fake = fakeWin32({
+      images: { 500: 'E:\\WPS\\office6\\et.exe', 700: image },
+      extraWindows: [[301, { pid: 700, root: 301, className }]],
+    })
+    fake.chip.owner = 301
+    assert.equal(ownerRelation(fake.api, 100), 'foreign')
+    fake.stop()
+  }
+})
 
 test('用户在取词窗口内自己按 Ctrl+C：用户复制的内容必须留在剪贴板里', async () => {
   // 应用对我们的注入迟迟不响应（慢应用），用户等不及自己按了 Ctrl+C——
